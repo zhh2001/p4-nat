@@ -5,6 +5,10 @@ const bit<16> ETHERTYPE_IPV4 = 0x0800;
 const bit<8> IP_PROTOCOL_TCP = 6;
 const bit<8> IP_PROTOCOL_UDP = 17;
 
+const bit<2> ZONE_UNSET = 0;
+const bit<2> ZONE_INSIDE = 1;
+const bit<2> ZONE_OUTSIDE = 2;
+
 header ethernet_t {
     bit<48> dst_addr;
     bit<48> src_addr;
@@ -55,6 +59,8 @@ struct headers_t {
 }
 
 struct metadata_t {
+    bit<2> ingress_zone;
+    bit<2> destination_zone;
 }
 
 parser ParserImpl(
@@ -122,8 +128,83 @@ control IngressImpl(
     inout metadata_t meta,
     inout standard_metadata_t standard_metadata)
 {
+    action set_zone(bit<2> zone) {
+        meta.ingress_zone = zone;
+    }
+
+    action set_destination_zone(bit<2> zone) {
+        meta.destination_zone = zone;
+    }
+
+    action forward(bit<9> port, bit<48> src_mac, bit<48> dst_mac) {
+        hdr.ethernet.src_addr = src_mac;
+        hdr.ethernet.dst_addr = dst_mac;
+        hdr.ipv4.ttl = hdr.ipv4.ttl - 1;
+        standard_metadata.egress_spec = port;
+    }
+
+    table zone_by_port {
+        key = {
+            standard_metadata.ingress_port: exact @name("ingress_port");
+        }
+        actions = {
+            set_zone;
+            NoAction;
+        }
+        size = 3;
+        default_action = NoAction();
+    }
+
+    table destination_zone {
+        key = {
+            hdr.ipv4.dst_addr: lpm @name("dst_addr");
+        }
+        actions = {
+            set_destination_zone;
+        }
+        size = 16;
+        default_action = set_destination_zone(ZONE_OUTSIDE);
+    }
+
+    table ipv4_lpm {
+        key = {
+            hdr.ipv4.dst_addr: lpm @name("dst_addr");
+        }
+        actions = {
+            forward;
+            NoAction;
+        }
+        size = 16;
+        default_action = NoAction();
+    }
+
     apply {
-        mark_to_drop(standard_metadata);
+        meta.ingress_zone = ZONE_UNSET;
+        meta.destination_zone = ZONE_OUTSIDE;
+
+        if (hdr.ipv4.isValid() &&
+            standard_metadata.parser_error == error.NoError &&
+            standard_metadata.checksum_error == 0 &&
+            hdr.ipv4.version == 4 &&
+            hdr.ipv4.ihl == 5 &&
+            hdr.ipv4.ttl > 1) {
+            if (zone_by_port.apply().hit) {
+                destination_zone.apply();
+
+                if (meta.ingress_zone == ZONE_INSIDE &&
+                    meta.destination_zone == ZONE_INSIDE) {
+                    if (!ipv4_lpm.apply().hit) {
+                        mark_to_drop(standard_metadata);
+                    }
+                } else {
+                    mark_to_drop(standard_metadata);
+                }
+            } else {
+                mark_to_drop(standard_metadata);
+            }
+        } else {
+            mark_to_drop(standard_metadata);
+        }
     }
 }
 
