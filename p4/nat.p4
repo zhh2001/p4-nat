@@ -2,6 +2,7 @@
 #include <v1model.p4>
 
 const bit<16> ETHERTYPE_IPV4 = 0x0800;
+const bit<32> ETHERNET_HEADER_BYTES = 14;
 const bit<8> IP_PROTOCOL_TCP = 6;
 const bit<8> IP_PROTOCOL_UDP = 17;
 
@@ -96,9 +97,13 @@ parser ParserImpl(
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
         meta.transport_len = hdr.ipv4.total_len - IPV4_HEADER_BYTES;
-        transition select(hdr.ipv4.ihl, hdr.ipv4.protocol) {
-            (5, IP_PROTOCOL_TCP): parse_tcp;
-            (5, IP_PROTOCOL_UDP): parse_udp;
+        transition select(
+            hdr.ipv4.ihl,
+            hdr.ipv4.flags[0:0],
+            hdr.ipv4.fragment_offset,
+            hdr.ipv4.protocol) {
+            (5, 0, 0, IP_PROTOCOL_TCP): parse_tcp;
+            (5, 0, 0, IP_PROTOCOL_UDP): parse_udp;
             default: accept;
         }
     }
@@ -280,6 +285,11 @@ control IngressImpl(
             standard_metadata.checksum_error == 0 &&
             hdr.ipv4.version == 4 &&
             hdr.ipv4.ihl == 5 &&
+            hdr.ipv4.total_len >= IPV4_HEADER_BYTES &&
+            (bit<32>) hdr.ipv4.total_len + ETHERNET_HEADER_BYTES <=
+                standard_metadata.packet_length &&
+            hdr.ipv4.flags[0:0] == 0 &&
+            hdr.ipv4.fragment_offset == 0 &&
             hdr.ipv4.ttl > 1) {
             if (hdr.tcp.isValid() &&
                 hdr.ipv4.total_len >=

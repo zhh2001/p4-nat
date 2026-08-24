@@ -159,6 +159,7 @@ def send_udp(
     token,
     ip_id,
     zero_checksum=False,
+    ip_flags=0,
 ):
     script = """
 import sys
@@ -166,7 +167,13 @@ from scapy.all import Ether, IP, Raw, UDP, sendp
 
 packet = (
     Ether(src=sys.argv[2], dst=sys.argv[3])
-    / IP(src=sys.argv[4], dst=sys.argv[5], ttl=64, id=int(sys.argv[8]))
+    / IP(
+        src=sys.argv[4],
+        dst=sys.argv[5],
+        ttl=64,
+        id=int(sys.argv[8]),
+        flags=int(sys.argv[11]),
+    )
     / UDP(sport=int(sys.argv[6]), dport=int(sys.argv[7]))
     / Raw(bytes.fromhex(sys.argv[9]))
 )
@@ -189,6 +196,7 @@ sendp(packet, iface=sys.argv[1], count=1, verbose=False)
             str(ip_id),
             token.hex(),
             "1" if zero_checksum else "0",
+            str(ip_flags),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -269,6 +277,44 @@ sendp(packet, iface=sys.argv[1], count=1, verbose=False)
         raise RuntimeError(f"packet injection failed: {detail}")
 
 
+def ipv4_test_frame(source, packet):
+    config = HOSTS[source]
+    return bytes(
+        Ether(src=config["mac"], dst=config["switch_mac"])
+        / packet
+    )
+
+
+def send_raw_frame(host, interface, frame):
+    script = """
+import socket
+import sys
+
+frame = bytes.fromhex(sys.argv[2])
+with socket.socket(
+    socket.AF_PACKET,
+    socket.SOCK_RAW,
+    socket.htons(0x0003),
+) as raw_socket:
+    raw_socket.bind((sys.argv[1], 0))
+    raw_socket.send(frame)
+"""
+    process = host.popen(
+        [sys.executable, "-c", script, interface, frame.hex()],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _, stderr = process.communicate(timeout=3.0)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        process.communicate()
+        raise RuntimeError("raw packet injection timed out") from error
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"raw packet injection failed: {detail}")
+
+
 class PacketIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -293,7 +339,16 @@ class PacketIntegrationTest(unittest.TestCase):
         if hasattr(cls, "runtime"):
             cls.runtime.close()
 
-    def assert_forwarded(self, source, destination, sport, dport, token, ip_id):
+    def assert_forwarded(
+        self,
+        source,
+        destination,
+        sport,
+        dport,
+        token,
+        ip_id,
+        ip_flags=0,
+    ):
         source_host = self.runtime.net.get(source)
         destination_host = self.runtime.net.get(destination)
         outside_host = self.runtime.net.get("h3")
@@ -333,6 +388,7 @@ class PacketIntegrationTest(unittest.TestCase):
                     dport,
                     token,
                     ip_id,
+                    ip_flags=ip_flags,
                 )
                 time.sleep(0.25)
             finally:
@@ -359,6 +415,8 @@ class PacketIntegrationTest(unittest.TestCase):
         self.assertEqual(packet[IP].src, source_ip)
         self.assertEqual(packet[IP].dst, destination_ip)
         self.assertEqual(packet[IP].ttl, 63)
+        self.assertEqual(packet[IP].id, ip_id)
+        self.assertEqual(int(packet[IP].flags), ip_flags)
         self.assertEqual(packet[UDP].sport, sport)
         self.assertEqual(packet[UDP].dport, dport)
         self.assertEqual(bytes(packet[Raw].load), token)
@@ -653,6 +711,52 @@ class PacketIntegrationTest(unittest.TestCase):
                 f"{direction}: unexpected encoded output UDP checksum",
             )
 
+    def assert_dropped(self, label, source, frame):
+        identifier = struct.unpack("!H", frame[18:20])[0]
+        capture_filter = f"ip and ip[4:2] = {identifier}"
+        source_host = self.runtime.net.get(source)
+
+        with tempfile.TemporaryDirectory(prefix="p4-nat-drop-") as directory:
+            captures = {
+                name: PacketCapture(
+                    self.runtime.net.get(name),
+                    self.runtime.net.get(name).defaultIntf().name,
+                    Path(directory) / f"{name}.pcap",
+                    capture_filter,
+                )
+                for name in HOSTS
+            }
+            try:
+                for capture in captures.values():
+                    capture.start()
+                send_raw_frame(
+                    source_host,
+                    source_host.defaultIntf().name,
+                    frame,
+                )
+                time.sleep(0.25)
+            finally:
+                for capture in captures.values():
+                    capture.stop()
+
+            observed = {
+                name: len(capture.packets())
+                for name, capture in captures.items()
+            }
+
+        self.assertEqual(
+            observed[source],
+            1,
+            f"{label}: expected one source observation on {source}, got {observed[source]}",
+        )
+        for name, count in observed.items():
+            if name != source:
+                self.assertEqual(
+                    count,
+                    0,
+                    f"{label}: observed {count} unexpected packets on {name}",
+                )
+
     def test_h1_to_h2_is_not_translated(self):
         self.assert_forwarded(
             "h1",
@@ -671,6 +775,17 @@ class PacketIntegrationTest(unittest.TestCase):
             dport=40202,
             token=b"inside-h2-to-h1-f7d6418e",
             ip_id=0x1202,
+        )
+
+    def test_h1_to_h2_df_packet_is_forwarded(self):
+        self.assert_forwarded(
+            "h1",
+            "h2",
+            sport=40103,
+            dport=40203,
+            token=b"inside-df-h1-to-h2-1c6a8e42",
+            ip_id=0x1203,
+            ip_flags=0x2,
         )
 
     def test_outbound_h1_tcp_translation(self):
@@ -860,6 +975,338 @@ class PacketIntegrationTest(unittest.TestCase):
             zero_checksum=False,
             expected_input_checksum=0xFFFF,
         )
+
+    def test_invalid_packets_fail_closed(self):
+        def tcp_frame(source, src_ip, dst_ip, identifier, sport, dport, ttl=64):
+            frame = ipv4_test_frame(
+                source,
+                IP(
+                    src=src_ip,
+                    dst=dst_ip,
+                    id=identifier,
+                    ttl=ttl,
+                )
+                / TCP(
+                    sport=sport,
+                    dport=dport,
+                    flags=0x18,
+                    seq=identifier,
+                    ack=identifier + 1,
+                )
+                / Raw(f"drop-{identifier:04x}".encode()),
+            )
+            self.assertTrue(
+                tcp_checksum_valid(Ether(frame)),
+                f"TCP fixture {identifier:#06x} has an invalid checksum",
+            )
+            return frame
+
+        bad_ipv4_checksum = bytearray(
+            tcp_frame(
+                "h1",
+                "10.0.1.1",
+                "10.0.3.1",
+                0x1507,
+                43007,
+                9307,
+            )
+        )
+        bad_ipv4_checksum[24] ^= 0x01
+
+        bad_tcp_data_offset = ipv4_test_frame(
+            "h1",
+            IP(
+                src="10.0.1.1",
+                dst="10.0.3.1",
+                id=0x150C,
+            )
+            / TCP(
+                sport=43012,
+                dport=9312,
+                dataofs=4,
+                flags=0x18,
+                seq=0x150C,
+                ack=0x150D,
+            )
+            / Raw(b"drop-tcp-offset-150c"),
+        )
+        self.assertTrue(
+            tcp_checksum_valid(Ether(bad_tcp_data_offset)),
+            "TCP data-offset fixture has an invalid checksum",
+        )
+
+        cases = [
+            (
+                "outbound private NAT miss",
+                "h1",
+                tcp_frame(
+                    "h1",
+                    "10.0.1.99",
+                    "10.0.3.1",
+                    0x1501,
+                    43001,
+                    9301,
+                ),
+            ),
+            (
+                "inbound public NAT miss",
+                "h3",
+                tcp_frame(
+                    "h3",
+                    "10.0.3.1",
+                    "192.0.2.99",
+                    0x1502,
+                    9302,
+                    43002,
+                ),
+            ),
+            (
+                "route miss after outbound NAT",
+                "h1",
+                tcp_frame(
+                    "h1",
+                    "10.0.1.1",
+                    "203.0.113.1",
+                    0x1503,
+                    43003,
+                    9303,
+                ),
+            ),
+            (
+                "NAT TTL one",
+                "h1",
+                tcp_frame(
+                    "h1",
+                    "10.0.1.1",
+                    "10.0.3.1",
+                    0x1504,
+                    43004,
+                    9304,
+                    ttl=1,
+                ),
+            ),
+            (
+                "NAT TTL zero",
+                "h1",
+                tcp_frame(
+                    "h1",
+                    "10.0.1.1",
+                    "10.0.3.1",
+                    0x1505,
+                    43005,
+                    9305,
+                    ttl=0,
+                ),
+            ),
+            (
+                "inside TTL one",
+                "h1",
+                tcp_frame(
+                    "h1",
+                    "10.0.1.1",
+                    "10.0.2.1",
+                    0x1506,
+                    43006,
+                    9306,
+                    ttl=1,
+                ),
+            ),
+            (
+                "invalid IPv4 checksum",
+                "h1",
+                bytes(bad_ipv4_checksum),
+            ),
+            (
+                "IPv4 options",
+                "h1",
+                ipv4_test_frame(
+                    "h1",
+                    IP(
+                        src="10.0.1.1",
+                        dst="10.0.2.1",
+                        id=0x1508,
+                        proto=99,
+                        options=b"\x01\x01\x01\x01",
+                    )
+                    / Raw(b"drop-options-1508"),
+                ),
+            ),
+            (
+                "first IPv4 fragment",
+                "h1",
+                ipv4_test_frame(
+                    "h1",
+                    IP(
+                        src="10.0.1.1",
+                        dst="10.0.2.1",
+                        id=0x1509,
+                        flags="MF",
+                    )
+                    / UDP(
+                        sport=44009,
+                        dport=9409,
+                        chksum=0,
+                    )
+                    / Raw(b"drop-first-fragment-1509"),
+                ),
+            ),
+            (
+                "non-first IPv4 fragment",
+                "h1",
+                ipv4_test_frame(
+                    "h1",
+                    IP(
+                        src="10.0.1.1",
+                        dst="10.0.2.1",
+                        id=0x150A,
+                        frag=1,
+                        proto=socket.IPPROTO_UDP,
+                    )
+                    / Raw(
+                        struct.pack(
+                            "!HHHH",
+                            44010,
+                            9410,
+                            8 + len(b"drop-later-fragment-150a"),
+                            0,
+                        )
+                        + b"drop-later-fragment-150a"
+                    ),
+                ),
+            ),
+            (
+                "unsupported outbound protocol",
+                "h1",
+                ipv4_test_frame(
+                    "h1",
+                    IP(
+                        src="10.0.1.1",
+                        dst="10.0.3.1",
+                        id=0x150B,
+                        proto=99,
+                    )
+                    / Raw(b"drop-protocol-150b"),
+                ),
+            ),
+            (
+                "TCP data offset below five",
+                "h1",
+                bad_tcp_data_offset,
+            ),
+            (
+                "truncated TCP header",
+                "h1",
+                ipv4_test_frame(
+                    "h1",
+                    IP(
+                        src="10.0.1.1",
+                        dst="10.0.3.1",
+                        id=0x150D,
+                        proto=socket.IPPROTO_TCP,
+                    )
+                    / Raw(
+                        struct.pack("!HHII", 43013, 9313, 0x150D, 0x150E)
+                    ),
+                ),
+            ),
+            (
+                "UDP length below eight",
+                "h1",
+                ipv4_test_frame(
+                    "h1",
+                    IP(
+                        src="10.0.1.1",
+                        dst="10.0.3.1",
+                        id=0x150E,
+                    )
+                    / UDP(
+                        sport=44014,
+                        dport=9414,
+                        len=7,
+                        chksum=0,
+                    ),
+                ),
+            ),
+            (
+                "UDP length differs from IPv4 payload",
+                "h1",
+                ipv4_test_frame(
+                    "h1",
+                    IP(
+                        src="10.0.1.1",
+                        dst="10.0.3.1",
+                        id=0x150F,
+                    )
+                    / UDP(
+                        sport=44015,
+                        dport=9415,
+                        len=8,
+                        chksum=0,
+                    )
+                    / Raw(b"drop-udp-length-150f"),
+                ),
+            ),
+            (
+                "IPv4 total length below header length",
+                "h1",
+                ipv4_test_frame(
+                    "h1",
+                    IP(
+                        src="10.0.1.1",
+                        dst="10.0.2.1",
+                        id=0x1510,
+                        len=19,
+                        proto=99,
+                    )
+                    / Raw(b"drop-short-length-1510"),
+                ),
+            ),
+            (
+                "IPv4 total length exceeds received packet",
+                "h1",
+                ipv4_test_frame(
+                    "h1",
+                    IP(
+                        src="10.0.1.1",
+                        dst="10.0.2.1",
+                        id=0x1511,
+                        len=100,
+                        proto=99,
+                    )
+                    / Raw(b"drop-long-length-1511"),
+                ),
+            ),
+            (
+                "IPv4 version not four",
+                "h1",
+                ipv4_test_frame(
+                    "h1",
+                    IP(
+                        version=5,
+                        ihl=5,
+                        src="10.0.1.1",
+                        dst="10.0.2.1",
+                        id=0x1512,
+                        proto=99,
+                    )
+                    / Raw(b"drop-version-five-1512"),
+                ),
+            ),
+        ]
+
+        identifiers = [struct.unpack("!H", frame[18:20])[0] for _, _, frame in cases]
+        self.assertEqual(len(identifiers), len(set(identifiers)))
+        for label, _, frame in cases:
+            header_length = (frame[14] & 0x0F) * 4
+            checksum = internet_checksum(frame[14 : 14 + header_length])
+            with self.subTest(fixture=label):
+                if label == "invalid IPv4 checksum":
+                    self.assertNotEqual(checksum, 0)
+                else:
+                    self.assertEqual(checksum, 0)
+        for label, source, frame in cases:
+            with self.subTest(case=label):
+                self.assert_dropped(label, source, frame)
 
 
 if __name__ == "__main__":
