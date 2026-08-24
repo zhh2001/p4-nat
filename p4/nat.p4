@@ -12,6 +12,7 @@ const bit<2> ZONE_PUBLIC = 3;
 
 const bit<16> IPV4_HEADER_BYTES = 20;
 const bit<16> TCP_MIN_HEADER_BYTES = 20;
+const bit<16> UDP_HEADER_BYTES = 8;
 
 header ethernet_t {
     bit<48> dst_addr;
@@ -66,7 +67,10 @@ struct metadata_t {
     bit<2> ingress_zone;
     bit<2> destination_zone;
     bit<1> route_ready;
+    bit<1> nat_transport_valid;
+    bit<1> udp_checksum_present;
     bit<16> transport_len;
+    bit<16> udp_checksum_zero;
 }
 
 parser ParserImpl(
@@ -76,6 +80,8 @@ parser ParserImpl(
     inout standard_metadata_t standard_metadata)
 {
     state start {
+        meta.udp_checksum_present = 0;
+        meta.udp_checksum_zero = 0;
         transition parse_ethernet;
     }
 
@@ -104,6 +110,14 @@ parser ParserImpl(
 
     state parse_udp {
         packet.extract(hdr.udp);
+        transition select(hdr.udp.checksum) {
+            0: accept;
+            default: mark_udp_checksum_present;
+        }
+    }
+
+    state mark_udp_checksum_present {
+        meta.udp_checksum_present = 1;
         transition accept;
     }
 }
@@ -148,6 +162,22 @@ control VerifyChecksumImpl(inout headers_t hdr, inout metadata_t meta) {
                 hdr.tcp.urgent_ptr
             },
             hdr.tcp.checksum,
+            HashAlgorithm.csum16);
+
+        verify_checksum_with_payload(
+            hdr.udp.isValid() && meta.udp_checksum_present == 1,
+            {
+                hdr.ipv4.src_addr,
+                hdr.ipv4.dst_addr,
+                8w0,
+                hdr.ipv4.protocol,
+                hdr.udp.length,
+                hdr.udp.src_port,
+                hdr.udp.dst_port,
+                hdr.udp.length,
+                hdr.udp.checksum
+            },
+            meta.udp_checksum_zero,
             HashAlgorithm.csum16);
     }
 }
@@ -243,6 +273,7 @@ control IngressImpl(
         meta.ingress_zone = ZONE_UNSET;
         meta.destination_zone = ZONE_OUTSIDE;
         meta.route_ready = 0;
+        meta.nat_transport_valid = 0;
 
         if (hdr.ipv4.isValid() &&
             standard_metadata.parser_error == error.NoError &&
@@ -250,6 +281,21 @@ control IngressImpl(
             hdr.ipv4.version == 4 &&
             hdr.ipv4.ihl == 5 &&
             hdr.ipv4.ttl > 1) {
+            if (hdr.tcp.isValid() &&
+                hdr.ipv4.total_len >=
+                    IPV4_HEADER_BYTES + TCP_MIN_HEADER_BYTES &&
+                hdr.tcp.data_offset >= 5 &&
+                ((bit<16>) hdr.tcp.data_offset << 2) <=
+                    meta.transport_len) {
+                meta.nat_transport_valid = 1;
+            } else if (hdr.udp.isValid() &&
+                       hdr.ipv4.total_len >=
+                           IPV4_HEADER_BYTES + UDP_HEADER_BYTES &&
+                       hdr.udp.length >= UDP_HEADER_BYTES &&
+                       hdr.udp.length == meta.transport_len) {
+                meta.nat_transport_valid = 1;
+            }
+
             if (zone_by_port.apply().hit) {
                 destination_zone.apply();
 
@@ -258,12 +304,7 @@ control IngressImpl(
                     meta.route_ready = 1;
                 } else if (meta.ingress_zone == ZONE_INSIDE &&
                            meta.destination_zone == ZONE_OUTSIDE) {
-                    if (hdr.tcp.isValid() &&
-                        hdr.ipv4.total_len >=
-                            IPV4_HEADER_BYTES + TCP_MIN_HEADER_BYTES &&
-                        hdr.tcp.data_offset >= 5 &&
-                        ((bit<16>) hdr.tcp.data_offset << 2) <=
-                            hdr.ipv4.total_len - IPV4_HEADER_BYTES &&
+                    if (meta.nat_transport_valid == 1 &&
                         nat_outbound.apply().hit) {
                         meta.route_ready = 1;
                     } else {
@@ -271,12 +312,7 @@ control IngressImpl(
                     }
                 } else if (meta.ingress_zone == ZONE_OUTSIDE &&
                            meta.destination_zone == ZONE_PUBLIC) {
-                    if (hdr.tcp.isValid() &&
-                        hdr.ipv4.total_len >=
-                            IPV4_HEADER_BYTES + TCP_MIN_HEADER_BYTES &&
-                        hdr.tcp.data_offset >= 5 &&
-                        ((bit<16>) hdr.tcp.data_offset << 2) <=
-                            hdr.ipv4.total_len - IPV4_HEADER_BYTES &&
+                    if (meta.nat_transport_valid == 1 &&
                         nat_inbound.apply().hit) {
                         meta.route_ready = 1;
                     } else {
@@ -347,6 +383,30 @@ control ComputeChecksumImpl(inout headers_t hdr, inout metadata_t meta) {
                 hdr.tcp.urgent_ptr
             },
             hdr.tcp.checksum,
+            HashAlgorithm.csum16);
+
+        update_checksum_with_payload(
+            hdr.udp.isValid() && meta.udp_checksum_present == 1,
+            {
+                hdr.ipv4.src_addr,
+                hdr.ipv4.dst_addr,
+                8w0,
+                hdr.ipv4.protocol,
+                hdr.udp.length,
+                hdr.udp.src_port,
+                hdr.udp.dst_port,
+                hdr.udp.length
+            },
+            hdr.udp.checksum,
+            HashAlgorithm.csum16);
+
+        update_checksum(
+            hdr.udp.isValid() &&
+                meta.udp_checksum_present == 1 &&
+                hdr.udp.checksum == 0,
+            // IPv4 UDP transmits a calculated zero as all ones.
+            { 16w0 },
+            hdr.udp.checksum,
             HashAlgorithm.csum16);
     }
 }

@@ -90,13 +90,51 @@ def internet_checksum(data):
 
 
 def udp_checksum_valid(packet):
-    udp = bytes(packet[UDP])
-    pseudo_header = (
-        socket.inet_aton(packet[IP].src)
-        + socket.inet_aton(packet[IP].dst)
-        + struct.pack("!BBH", 0, packet[IP].proto, len(udp))
+    if not packet.haslayer(IP) or not packet.haslayer(UDP):
+        return False
+    raw_ip = bytes(packet[IP])
+    if len(raw_ip) < 20 or raw_ip[0] >> 4 != 4:
+        return False
+    header_length = (raw_ip[0] & 0x0F) * 4
+    total_length = struct.unpack("!H", raw_ip[2:4])[0]
+    if (
+        header_length < 20
+        or total_length < header_length + 8
+        or total_length > len(raw_ip)
+        or raw_ip[9] != socket.IPPROTO_UDP
+    ):
+        return False
+    udp_length = struct.unpack("!H", raw_ip[header_length + 4 : header_length + 6])[0]
+    if (
+        udp_length < 8
+        or udp_length != total_length - header_length
+        or packet[UDP].len != udp_length
+    ):
+        return False
+    udp = raw_ip[header_length : header_length + udp_length]
+    checksum = struct.unpack("!H", udp[6:8])[0]
+    pseudo_header = raw_ip[12:20] + struct.pack(
+        "!BBH", 0, socket.IPPROTO_UDP, udp_length
     )
-    return packet[UDP].chksum != 0 and internet_checksum(pseudo_header + udp) == 0
+    return checksum != 0 and internet_checksum(pseudo_header + udp) == 0
+
+
+def udp_payload_for_checksum_result_zero(src_ip, dst_ip, sport, dport, prefix):
+    """Append a word that makes the UDP checksum calculation return zero."""
+    if len(prefix) % 2:
+        raise ValueError("UDP checksum correction prefix must have even length")
+    udp_length = 8 + len(prefix) + 2
+    pseudo_header = (
+        socket.inet_aton(src_ip)
+        + socket.inet_aton(dst_ip)
+        + struct.pack("!BBH", 0, socket.IPPROTO_UDP, udp_length)
+    )
+    udp_header = struct.pack("!HHHH", sport, dport, udp_length, 0)
+    correction = internet_checksum(pseudo_header + udp_header + prefix + b"\x00\x00")
+    payload = prefix + struct.pack("!H", correction)
+    if internet_checksum(pseudo_header + udp_header + payload) != 0:
+        raise AssertionError("failed to construct UDP checksum correction")
+    return payload
 
 
 def tcp_checksum_valid(packet):
@@ -109,7 +147,19 @@ def tcp_checksum_valid(packet):
     return internet_checksum(pseudo_header + tcp) == 0
 
 
-def send_udp(host, interface, src_mac, dst_mac, src_ip, dst_ip, sport, dport, token, ip_id):
+def send_udp(
+    host,
+    interface,
+    src_mac,
+    dst_mac,
+    src_ip,
+    dst_ip,
+    sport,
+    dport,
+    token,
+    ip_id,
+    zero_checksum=False,
+):
     script = """
 import sys
 from scapy.all import Ether, IP, Raw, UDP, sendp
@@ -120,6 +170,8 @@ packet = (
     / UDP(sport=int(sys.argv[6]), dport=int(sys.argv[7]))
     / Raw(bytes.fromhex(sys.argv[9]))
 )
+if sys.argv[10] == "1":
+    packet[UDP].chksum = 0
 sendp(packet, iface=sys.argv[1], count=1, verbose=False)
 """
     process = host.popen(
@@ -136,6 +188,7 @@ sendp(packet, iface=sys.argv[1], count=1, verbose=False)
             str(dport),
             str(ip_id),
             token.hex(),
+            "1" if zero_checksum else "0",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -452,6 +505,154 @@ class PacketIntegrationTest(unittest.TestCase):
                 f"{direction}: invalid {label} TCP checksum",
             )
 
+    def assert_udp_translation(
+        self,
+        source,
+        destination,
+        unintended,
+        input_src_ip,
+        input_dst_ip,
+        output_src_ip,
+        output_dst_ip,
+        sport,
+        dport,
+        token,
+        ip_id,
+        zero_checksum,
+        expected_input_checksum=None,
+        expected_output_checksum=None,
+    ):
+        source_host = self.runtime.net.get(source)
+        destination_host = self.runtime.net.get(destination)
+        unintended_host = self.runtime.net.get(unintended)
+        source_config = HOSTS[source]
+        destination_config = HOSTS[destination]
+        capture_filter = f"udp and src port {sport} and dst port {dport}"
+        direction = f"UDP {input_src_ip}->{input_dst_ip}"
+
+        with tempfile.TemporaryDirectory(prefix="p4-nat-udp-") as directory:
+            before = PacketCapture(
+                source_host,
+                source_host.defaultIntf().name,
+                Path(directory) / "before.pcap",
+                capture_filter,
+            )
+            after = PacketCapture(
+                destination_host,
+                destination_host.defaultIntf().name,
+                Path(directory) / "after.pcap",
+                capture_filter,
+            )
+            unexpected = PacketCapture(
+                unintended_host,
+                unintended_host.defaultIntf().name,
+                Path(directory) / "unexpected.pcap",
+                capture_filter,
+            )
+            try:
+                before.start()
+                after.start()
+                unexpected.start()
+                send_udp(
+                    source_host,
+                    source_host.defaultIntf().name,
+                    source_config["mac"],
+                    source_config["switch_mac"],
+                    input_src_ip,
+                    input_dst_ip,
+                    sport,
+                    dport,
+                    token,
+                    ip_id,
+                    zero_checksum=zero_checksum,
+                )
+                time.sleep(0.25)
+            finally:
+                before.stop()
+                after.stop()
+                unexpected.stop()
+
+            before_packets = before.packets()
+            after_packets = after.packets()
+            unexpected_packets = unexpected.packets()
+
+        self.assertEqual(
+            len(before_packets),
+            1,
+            f"{direction}: expected one input packet, got {len(before_packets)}",
+        )
+        self.assertEqual(
+            len(after_packets),
+            1,
+            f"{direction}: expected one output packet, got {len(after_packets)}",
+        )
+        self.assertEqual(
+            len(unexpected_packets),
+            0,
+            f"{direction}: observed {len(unexpected_packets)} packets on {unintended}",
+        )
+
+        input_packet = before_packets[0]
+        output_packet = after_packets[0]
+        self.assertEqual(input_packet[Ether].src, source_config["mac"])
+        self.assertEqual(input_packet[Ether].dst, source_config["switch_mac"])
+        self.assertEqual(output_packet[Ether].src, destination_config["switch_mac"])
+        self.assertEqual(output_packet[Ether].dst, destination_config["mac"])
+        self.assertEqual(input_packet[IP].src, input_src_ip)
+        self.assertEqual(input_packet[IP].dst, input_dst_ip)
+        self.assertEqual(output_packet[IP].src, output_src_ip)
+        self.assertEqual(output_packet[IP].dst, output_dst_ip)
+        self.assertEqual(input_packet[IP].ttl, 64)
+        self.assertEqual(output_packet[IP].ttl, input_packet[IP].ttl - 1)
+        self.assertEqual(input_packet[IP].id, ip_id)
+        self.assertEqual(output_packet[IP].id, input_packet[IP].id)
+        self.assertEqual(input_packet[UDP].sport, sport)
+        self.assertEqual(input_packet[UDP].dport, dport)
+        self.assertEqual(output_packet[UDP].sport, input_packet[UDP].sport)
+        self.assertEqual(output_packet[UDP].dport, input_packet[UDP].dport)
+        expected_udp_length = 8 + len(token)
+        self.assertEqual(input_packet[UDP].len, expected_udp_length)
+        self.assertEqual(output_packet[UDP].len, input_packet[UDP].len)
+        self.assertEqual(bytes(input_packet[Raw].load), token)
+        self.assertEqual(bytes(output_packet[Raw].load), bytes(input_packet[Raw].load))
+
+        for label, packet in (("input", input_packet), ("output", output_packet)):
+            raw_ip = bytes(packet[IP])
+            header_length = (raw_ip[0] & 0x0F) * 4
+            self.assertEqual(
+                internet_checksum(raw_ip[:header_length]),
+                0,
+                f"{direction}: invalid {label} IPv4 checksum",
+            )
+            if zero_checksum:
+                self.assertEqual(
+                    packet[UDP].chksum,
+                    0,
+                    f"{direction}: {label} UDP zero checksum was not preserved",
+                )
+            else:
+                self.assertNotEqual(
+                    packet[UDP].chksum,
+                    0,
+                    f"{direction}: {label} UDP checksum is zero",
+                )
+                self.assertTrue(
+                    udp_checksum_valid(packet),
+                    f"{direction}: invalid {label} UDP checksum",
+                )
+        if expected_input_checksum is not None:
+            self.assertEqual(
+                input_packet[UDP].chksum,
+                expected_input_checksum,
+                f"{direction}: unexpected encoded input UDP checksum",
+            )
+        if expected_output_checksum is not None:
+            self.assertEqual(
+                output_packet[UDP].chksum,
+                expected_output_checksum,
+                f"{direction}: unexpected encoded output UDP checksum",
+            )
+
     def test_h1_to_h2_is_not_translated(self):
         self.assert_forwarded(
             "h1",
@@ -542,6 +743,122 @@ class PacketIntegrationTest(unittest.TestCase):
             acknowledgment=0x40506070,
             token=b"tcp-in-h2-a64c813f",
             ip_id=0x1304,
+        )
+
+    def test_outbound_h1_udp_translation(self):
+        self.assert_udp_translation(
+            source="h1",
+            destination="h3",
+            unintended="h2",
+            input_src_ip="10.0.1.1",
+            input_dst_ip="10.0.3.1",
+            output_src_ip="192.0.2.1",
+            output_dst_ip="10.0.3.1",
+            sport=41001,
+            dport=9080,
+            token=b"udp-out-h1-684fa2d3",
+            ip_id=0x1401,
+            zero_checksum=False,
+        )
+
+    def test_inbound_h1_udp_translation(self):
+        self.assert_udp_translation(
+            source="h3",
+            destination="h1",
+            unintended="h2",
+            input_src_ip="10.0.3.1",
+            input_dst_ip="192.0.2.1",
+            output_src_ip="10.0.3.1",
+            output_dst_ip="10.0.1.1",
+            sport=9081,
+            dport=41011,
+            token=b"udp-in-h1-c18b6375",
+            ip_id=0x1402,
+            zero_checksum=False,
+        )
+
+    def test_outbound_h1_udp_zero_checksum(self):
+        self.assert_udp_translation(
+            source="h1",
+            destination="h3",
+            unintended="h2",
+            input_src_ip="10.0.1.1",
+            input_dst_ip="10.0.3.1",
+            output_src_ip="192.0.2.1",
+            output_dst_ip="10.0.3.1",
+            sport=41002,
+            dport=9082,
+            token=b"udp-zero-out-58d10e7c",
+            ip_id=0x1403,
+            zero_checksum=True,
+        )
+
+    def test_inbound_h1_udp_zero_checksum(self):
+        self.assert_udp_translation(
+            source="h3",
+            destination="h1",
+            unintended="h2",
+            input_src_ip="10.0.3.1",
+            input_dst_ip="192.0.2.1",
+            output_src_ip="10.0.3.1",
+            output_dst_ip="10.0.1.1",
+            sport=9083,
+            dport=41012,
+            token=b"udp-zero-in-b04c923a",
+            ip_id=0x1404,
+            zero_checksum=True,
+        )
+
+    def test_outbound_h1_udp_zero_result_is_encoded_as_ffff(self):
+        sport = 41003
+        dport = 9084
+        token = udp_payload_for_checksum_result_zero(
+            "192.0.2.1",
+            "10.0.3.1",
+            sport,
+            dport,
+            b"udp-ffff-h1-edge",
+        )
+        self.assert_udp_translation(
+            source="h1",
+            destination="h3",
+            unintended="h2",
+            input_src_ip="10.0.1.1",
+            input_dst_ip="10.0.3.1",
+            output_src_ip="192.0.2.1",
+            output_dst_ip="10.0.3.1",
+            sport=sport,
+            dport=dport,
+            token=token,
+            ip_id=0x1405,
+            zero_checksum=False,
+            expected_output_checksum=0xFFFF,
+        )
+
+    def test_outbound_h1_udp_input_zero_result_is_encoded_as_ffff(self):
+        sport = 41004
+        dport = 9085
+        token = udp_payload_for_checksum_result_zero(
+            "10.0.1.1",
+            "10.0.3.1",
+            sport,
+            dport,
+            b"udp-in-ffff-h1-x",
+        )
+        self.assert_udp_translation(
+            source="h1",
+            destination="h3",
+            unintended="h2",
+            input_src_ip="10.0.1.1",
+            input_dst_ip="10.0.3.1",
+            output_src_ip="192.0.2.1",
+            output_dst_ip="10.0.3.1",
+            sport=sport,
+            dport=dport,
+            token=token,
+            ip_id=0x1406,
+            zero_checksum=False,
+            expected_input_checksum=0xFFFF,
         )
 
 
