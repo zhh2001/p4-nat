@@ -10,7 +10,7 @@ import time
 import unittest
 from pathlib import Path
 
-from scapy.all import Ether, IP, Raw, UDP, rdpcap
+from scapy.all import Ether, IP, Raw, TCP, UDP, rdpcap
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,6 +99,16 @@ def udp_checksum_valid(packet):
     return packet[UDP].chksum != 0 and internet_checksum(pseudo_header + udp) == 0
 
 
+def tcp_checksum_valid(packet):
+    tcp = bytes(packet[TCP])
+    pseudo_header = (
+        socket.inet_aton(packet[IP].src)
+        + socket.inet_aton(packet[IP].dst)
+        + struct.pack("!BBH", 0, packet[IP].proto, len(tcp))
+    )
+    return internet_checksum(pseudo_header + tcp) == 0
+
+
 def send_udp(host, interface, src_mac, dst_mac, src_ip, dst_ip, sport, dport, token, ip_id):
     script = """
 import sys
@@ -141,7 +151,72 @@ sendp(packet, iface=sys.argv[1], count=1, verbose=False)
         raise RuntimeError(f"packet injection failed: {detail}")
 
 
-class InsideForwardingTest(unittest.TestCase):
+def send_tcp(
+    host,
+    interface,
+    src_mac,
+    dst_mac,
+    src_ip,
+    dst_ip,
+    sport,
+    dport,
+    flags,
+    sequence,
+    acknowledgment,
+    token,
+    ip_id,
+):
+    script = """
+import sys
+from scapy.all import Ether, IP, Raw, TCP, sendp
+
+packet = (
+    Ether(src=sys.argv[2], dst=sys.argv[3])
+    / IP(src=sys.argv[4], dst=sys.argv[5], ttl=64, id=int(sys.argv[11]))
+    / TCP(
+        sport=int(sys.argv[6]),
+        dport=int(sys.argv[7]),
+        flags=int(sys.argv[8]),
+        seq=int(sys.argv[9]),
+        ack=int(sys.argv[10]),
+    )
+    / Raw(bytes.fromhex(sys.argv[12]))
+)
+sendp(packet, iface=sys.argv[1], count=1, verbose=False)
+"""
+    process = host.popen(
+        [
+            sys.executable,
+            "-c",
+            script,
+            interface,
+            src_mac,
+            dst_mac,
+            src_ip,
+            dst_ip,
+            str(sport),
+            str(dport),
+            str(flags),
+            str(sequence),
+            str(acknowledgment),
+            str(ip_id),
+            token.hex(),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _, stderr = process.communicate(timeout=3.0)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        process.communicate()
+        raise RuntimeError("packet injection timed out") from error
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"packet injection failed: {detail}")
+
+
+class PacketIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if os.geteuid() != 0:
@@ -154,7 +229,7 @@ class InsideForwardingTest(unittest.TestCase):
             thrift_port=int(os.environ.get("P4NAT_THRIFT_PORT", "9090")),
         )
         cls.runtime.start()
-        if cls.runtime.controller_output != "configured and verified 9 table entries":
+        if cls.runtime.controller_output != "configured and verified 13 table entries":
             cls.runtime.close()
             raise AssertionError(
                 f"unexpected controller output: {cls.runtime.controller_output!r}"
@@ -247,6 +322,136 @@ class InsideForwardingTest(unittest.TestCase):
             f"{source}->{destination}: invalid forwarded IPv4 checksum",
         )
 
+    def assert_tcp_translation(
+        self,
+        source,
+        destination,
+        unintended,
+        input_src_ip,
+        input_dst_ip,
+        output_src_ip,
+        output_dst_ip,
+        sport,
+        dport,
+        flags,
+        sequence,
+        acknowledgment,
+        token,
+        ip_id,
+    ):
+        source_host = self.runtime.net.get(source)
+        destination_host = self.runtime.net.get(destination)
+        unintended_host = self.runtime.net.get(unintended)
+        source_config = HOSTS[source]
+        destination_config = HOSTS[destination]
+        capture_filter = f"tcp and src port {sport} and dst port {dport}"
+        direction = f"{input_src_ip}->{input_dst_ip}"
+
+        with tempfile.TemporaryDirectory(prefix="p4-nat-tcp-") as directory:
+            before = PacketCapture(
+                source_host,
+                source_host.defaultIntf().name,
+                Path(directory) / "before.pcap",
+                capture_filter,
+            )
+            after = PacketCapture(
+                destination_host,
+                destination_host.defaultIntf().name,
+                Path(directory) / "after.pcap",
+                capture_filter,
+            )
+            unexpected = PacketCapture(
+                unintended_host,
+                unintended_host.defaultIntf().name,
+                Path(directory) / "unexpected.pcap",
+                capture_filter,
+            )
+            try:
+                before.start()
+                after.start()
+                unexpected.start()
+                send_tcp(
+                    source_host,
+                    source_host.defaultIntf().name,
+                    source_config["mac"],
+                    source_config["switch_mac"],
+                    input_src_ip,
+                    input_dst_ip,
+                    sport,
+                    dport,
+                    flags,
+                    sequence,
+                    acknowledgment,
+                    token,
+                    ip_id,
+                )
+                time.sleep(0.25)
+            finally:
+                before.stop()
+                after.stop()
+                unexpected.stop()
+
+            before_packets = before.packets()
+            after_packets = after.packets()
+            unexpected_packets = unexpected.packets()
+
+        self.assertEqual(
+            len(before_packets),
+            1,
+            f"{direction}: expected one input packet, got {len(before_packets)}",
+        )
+        self.assertEqual(
+            len(after_packets),
+            1,
+            f"{direction}: expected one output packet, got {len(after_packets)}",
+        )
+        self.assertEqual(
+            len(unexpected_packets),
+            0,
+            f"{direction}: observed {len(unexpected_packets)} packets on {unintended}",
+        )
+
+        input_packet = before_packets[0]
+        output_packet = after_packets[0]
+        self.assertEqual(input_packet[Ether].src, source_config["mac"])
+        self.assertEqual(input_packet[Ether].dst, source_config["switch_mac"])
+        self.assertEqual(output_packet[Ether].src, destination_config["switch_mac"])
+        self.assertEqual(output_packet[Ether].dst, destination_config["mac"])
+        self.assertEqual(input_packet[IP].src, input_src_ip)
+        self.assertEqual(input_packet[IP].dst, input_dst_ip)
+        self.assertEqual(output_packet[IP].src, output_src_ip)
+        self.assertEqual(output_packet[IP].dst, output_dst_ip)
+        self.assertEqual(input_packet[IP].ttl, 64)
+        self.assertEqual(output_packet[IP].ttl, input_packet[IP].ttl - 1)
+        self.assertEqual(input_packet[IP].id, ip_id)
+        self.assertEqual(output_packet[IP].id, input_packet[IP].id)
+
+        self.assertEqual(input_packet[TCP].sport, sport)
+        self.assertEqual(input_packet[TCP].dport, dport)
+        self.assertEqual(output_packet[TCP].sport, input_packet[TCP].sport)
+        self.assertEqual(output_packet[TCP].dport, input_packet[TCP].dport)
+        self.assertEqual(int(input_packet[TCP].flags), flags)
+        self.assertEqual(int(output_packet[TCP].flags), int(input_packet[TCP].flags))
+        self.assertEqual(input_packet[TCP].seq, sequence)
+        self.assertEqual(input_packet[TCP].ack, acknowledgment)
+        self.assertEqual(output_packet[TCP].seq, input_packet[TCP].seq)
+        self.assertEqual(output_packet[TCP].ack, input_packet[TCP].ack)
+        self.assertEqual(bytes(input_packet[Raw].load), token)
+        self.assertEqual(bytes(output_packet[Raw].load), bytes(input_packet[Raw].load))
+
+        for label, packet in (("input", input_packet), ("output", output_packet)):
+            raw_ip = bytes(packet[IP])
+            header_length = (raw_ip[0] & 0x0F) * 4
+            self.assertEqual(
+                internet_checksum(raw_ip[:header_length]),
+                0,
+                f"{direction}: invalid {label} IPv4 checksum",
+            )
+            self.assertTrue(
+                tcp_checksum_valid(packet),
+                f"{direction}: invalid {label} TCP checksum",
+            )
+
     def test_h1_to_h2_is_not_translated(self):
         self.assert_forwarded(
             "h1",
@@ -265,6 +470,78 @@ class InsideForwardingTest(unittest.TestCase):
             dport=40202,
             token=b"inside-h2-to-h1-f7d6418e",
             ip_id=0x1202,
+        )
+
+    def test_outbound_h1_tcp_translation(self):
+        self.assert_tcp_translation(
+            source="h1",
+            destination="h3",
+            unintended="h2",
+            input_src_ip="10.0.1.1",
+            input_dst_ip="10.0.3.1",
+            output_src_ip="192.0.2.1",
+            output_dst_ip="10.0.3.1",
+            sport=40001,
+            dport=8080,
+            flags=0x18,
+            sequence=0x13572468,
+            acknowledgment=0x10203040,
+            token=b"tcp-out-h1-c85d7b31",
+            ip_id=0x1301,
+        )
+
+    def test_inbound_h1_tcp_translation(self):
+        self.assert_tcp_translation(
+            source="h3",
+            destination="h1",
+            unintended="h2",
+            input_src_ip="10.0.3.1",
+            input_dst_ip="192.0.2.1",
+            output_src_ip="10.0.3.1",
+            output_dst_ip="10.0.1.1",
+            sport=8081,
+            dport=40011,
+            flags=0x12,
+            sequence=0x23456789,
+            acknowledgment=0x20304050,
+            token=b"tcp-in-h1-7fb29a64",
+            ip_id=0x1302,
+        )
+
+    def test_outbound_h2_tcp_translation(self):
+        self.assert_tcp_translation(
+            source="h2",
+            destination="h3",
+            unintended="h1",
+            input_src_ip="10.0.2.1",
+            input_dst_ip="10.0.3.1",
+            output_src_ip="192.0.2.2",
+            output_dst_ip="10.0.3.1",
+            sport=40002,
+            dport=8082,
+            flags=0x11,
+            sequence=0x3456789A,
+            acknowledgment=0x30405060,
+            token=b"tcp-out-h2-3291e5ad",
+            ip_id=0x1303,
+        )
+
+    def test_inbound_h2_tcp_translation(self):
+        self.assert_tcp_translation(
+            source="h3",
+            destination="h2",
+            unintended="h1",
+            input_src_ip="10.0.3.1",
+            input_dst_ip="192.0.2.2",
+            output_src_ip="10.0.3.1",
+            output_dst_ip="10.0.2.1",
+            sport=8083,
+            dport=40012,
+            flags=0x10,
+            sequence=0x456789AB,
+            acknowledgment=0x40506070,
+            token=b"tcp-in-h2-a64c813f",
+            ip_id=0x1304,
         )
 
 

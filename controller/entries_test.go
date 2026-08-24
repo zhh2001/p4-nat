@@ -12,12 +12,16 @@ import (
 )
 
 const (
-	testZoneTable        = 1001
-	testDestinationTable = 1002
-	testRouteTable       = 1003
-	testSetZoneAction    = 2001
-	testSetDestAction    = 2002
-	testForwardAction    = 2003
+	testZoneTable           = 1001
+	testDestinationTable    = 1002
+	testRouteTable          = 1003
+	testOutboundNATTable    = 1004
+	testInboundNATTable     = 1005
+	testSetZoneAction       = 2001
+	testSetDestAction       = 2002
+	testForwardAction       = 2003
+	testSetPublicAddrAction = 2004
+	testSetPrivateAction    = 2005
 )
 
 func TestConfigurationEntries(t *testing.T) {
@@ -49,6 +53,14 @@ func TestConfigurationEntries(t *testing.T) {
 			actionParam(1, []byte{3}),
 			actionParam(2, []byte{0xaa, 0, 0, 3, 1}),
 			actionParam(3, []byte{3, 1})),
+		exactEntry(testOutboundNATTable, 1, []byte{10, 0, 1, 1},
+			testSetPublicAddrAction, actionParam(1, []byte{192, 0, 2, 1})),
+		exactEntry(testInboundNATTable, 1, []byte{192, 0, 2, 1},
+			testSetPrivateAction, actionParam(1, []byte{10, 0, 1, 1})),
+		exactEntry(testOutboundNATTable, 1, []byte{10, 0, 2, 1},
+			testSetPublicAddrAction, actionParam(1, []byte{192, 0, 2, 2})),
+		exactEntry(testInboundNATTable, 1, []byte{192, 0, 2, 2},
+			testSetPrivateAction, actionParam(1, []byte{10, 0, 2, 1})),
 	}
 
 	if err := verifyEntries(want, got); err != nil {
@@ -90,6 +102,10 @@ func testPipeline(t *testing.T) *pipeline.Pipeline {
 				"dst_addr", 32, p4configv1.MatchField_LPM),
 			testTable(testRouteTable, "IngressImpl.ipv4_lpm", "ipv4_lpm",
 				"dst_addr", 32, p4configv1.MatchField_LPM),
+			testTable(testOutboundNATTable, "IngressImpl.nat_outbound", "nat_outbound",
+				"private_addr", 32, p4configv1.MatchField_EXACT),
+			testTable(testInboundNATTable, "IngressImpl.nat_inbound", "nat_inbound",
+				"public_addr", 32, p4configv1.MatchField_EXACT),
 		},
 		Actions: []*p4configv1.Action{
 			testAction(testSetZoneAction, "IngressImpl.set_zone", "set_zone",
@@ -100,6 +116,10 @@ func testPipeline(t *testing.T) *pipeline.Pipeline {
 				testParam(1, "port", 9),
 				testParam(2, "src_mac", 48),
 				testParam(3, "dst_mac", 48)),
+			testAction(testSetPublicAddrAction, "IngressImpl.set_public_address", "set_public_address",
+				testParam(1, "public_addr", 32)),
+			testAction(testSetPrivateAction, "IngressImpl.set_private_address", "set_private_address",
+				testParam(1, "private_addr", 32)),
 		},
 	}
 	pl, err := pipeline.New(info, nil)

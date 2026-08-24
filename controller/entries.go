@@ -36,6 +36,11 @@ type route struct {
 	dstMAC string
 }
 
+type staticMapping struct {
+	privateAddr string
+	publicAddr  string
+}
+
 var portZones = []portZone{
 	{port: 1, zone: zoneInside},
 	{port: 2, zone: zoneInside},
@@ -63,8 +68,14 @@ var routes = []route{
 	},
 }
 
+var staticMappings = []staticMapping{
+	{privateAddr: "10.0.1.1", publicAddr: "192.0.2.1"},
+	{privateAddr: "10.0.2.1", publicAddr: "192.0.2.2"},
+}
+
 func configurationEntries(pl *pipeline.Pipeline) ([]*p4v1.TableEntry, error) {
-	entries := make([]*p4v1.TableEntry, 0, len(portZones)+len(destinationZones)+len(routes))
+	entries := make([]*p4v1.TableEntry, 0,
+		len(portZones)+len(destinationZones)+len(routes)+2*len(staticMappings))
 
 	for _, spec := range portZones {
 		entry, err := portZoneEntry(pl, spec)
@@ -86,6 +97,42 @@ func configurationEntries(pl *pipeline.Pipeline) ([]*p4v1.TableEntry, error) {
 			return nil, err
 		}
 		entries = append(entries, entry)
+	}
+	natEntries, err := staticNATEntries(pl)
+	if err != nil {
+		return nil, err
+	}
+	entries = append(entries, natEntries...)
+	return entries, nil
+}
+
+func staticNATEntries(pl *pipeline.Pipeline) ([]*p4v1.TableEntry, error) {
+	entries := make([]*p4v1.TableEntry, 0, 2*len(staticMappings))
+	for _, mapping := range staticMappings {
+		privateAddr, err := codec.IPv4(mapping.privateAddr)
+		if err != nil {
+			return nil, fmt.Errorf("encode private address %s: %w", mapping.privateAddr, err)
+		}
+		publicAddr, err := codec.IPv4(mapping.publicAddr)
+		if err != nil {
+			return nil, fmt.Errorf("encode public address %s: %w", mapping.publicAddr, err)
+		}
+
+		outbound, err := tableentry.NewBuilder(pl, "nat_outbound").
+			Match("private_addr", tableentry.Exact(privateAddr)).
+			Action("set_public_address", tableentry.Param("public_addr", publicAddr)).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("build outbound NAT entry for %s: %w", mapping.privateAddr, err)
+		}
+		inbound, err := tableentry.NewBuilder(pl, "nat_inbound").
+			Match("public_addr", tableentry.Exact(publicAddr)).
+			Action("set_private_address", tableentry.Param("private_addr", privateAddr)).
+			Build()
+		if err != nil {
+			return nil, fmt.Errorf("build inbound NAT entry for %s: %w", mapping.publicAddr, err)
+		}
+		entries = append(entries, outbound, inbound)
 	}
 	return entries, nil
 }

@@ -8,6 +8,10 @@ const bit<8> IP_PROTOCOL_UDP = 17;
 const bit<2> ZONE_UNSET = 0;
 const bit<2> ZONE_INSIDE = 1;
 const bit<2> ZONE_OUTSIDE = 2;
+const bit<2> ZONE_PUBLIC = 3;
+
+const bit<16> IPV4_HEADER_BYTES = 20;
+const bit<16> TCP_MIN_HEADER_BYTES = 20;
 
 header ethernet_t {
     bit<48> dst_addr;
@@ -61,6 +65,8 @@ struct headers_t {
 struct metadata_t {
     bit<2> ingress_zone;
     bit<2> destination_zone;
+    bit<1> route_ready;
+    bit<16> transport_len;
 }
 
 parser ParserImpl(
@@ -83,6 +89,7 @@ parser ParserImpl(
 
     state parse_ipv4 {
         packet.extract(hdr.ipv4);
+        meta.transport_len = hdr.ipv4.total_len - IPV4_HEADER_BYTES;
         transition select(hdr.ipv4.ihl, hdr.ipv4.protocol) {
             (5, IP_PROTOCOL_TCP): parse_tcp;
             (5, IP_PROTOCOL_UDP): parse_udp;
@@ -120,6 +127,28 @@ control VerifyChecksumImpl(inout headers_t hdr, inout metadata_t meta) {
             },
             hdr.ipv4.hdr_checksum,
             HashAlgorithm.csum16);
+
+        verify_checksum_with_payload(
+            hdr.tcp.isValid(),
+            {
+                hdr.ipv4.src_addr,
+                hdr.ipv4.dst_addr,
+                8w0,
+                hdr.ipv4.protocol,
+                meta.transport_len,
+                hdr.tcp.src_port,
+                hdr.tcp.dst_port,
+                hdr.tcp.seq_no,
+                hdr.tcp.ack_no,
+                hdr.tcp.data_offset,
+                hdr.tcp.reserved,
+                hdr.tcp.ns,
+                hdr.tcp.flags,
+                hdr.tcp.window,
+                hdr.tcp.urgent_ptr
+            },
+            hdr.tcp.checksum,
+            HashAlgorithm.csum16);
     }
 }
 
@@ -134,6 +163,14 @@ control IngressImpl(
 
     action set_destination_zone(bit<2> zone) {
         meta.destination_zone = zone;
+    }
+
+    action set_public_address(bit<32> public_addr) {
+        hdr.ipv4.src_addr = public_addr;
+    }
+
+    action set_private_address(bit<32> private_addr) {
+        hdr.ipv4.dst_addr = private_addr;
     }
 
     action forward(bit<9> port, bit<48> src_mac, bit<48> dst_mac) {
@@ -178,9 +215,34 @@ control IngressImpl(
         default_action = NoAction();
     }
 
+    table nat_outbound {
+        key = {
+            hdr.ipv4.src_addr: exact @name("private_addr");
+        }
+        actions = {
+            set_public_address;
+            NoAction;
+        }
+        size = 16;
+        default_action = NoAction();
+    }
+
+    table nat_inbound {
+        key = {
+            hdr.ipv4.dst_addr: exact @name("public_addr");
+        }
+        actions = {
+            set_private_address;
+            NoAction;
+        }
+        size = 16;
+        default_action = NoAction();
+    }
+
     apply {
         meta.ingress_zone = ZONE_UNSET;
         meta.destination_zone = ZONE_OUTSIDE;
+        meta.route_ready = 0;
 
         if (hdr.ipv4.isValid() &&
             standard_metadata.parser_error == error.NoError &&
@@ -193,10 +255,38 @@ control IngressImpl(
 
                 if (meta.ingress_zone == ZONE_INSIDE &&
                     meta.destination_zone == ZONE_INSIDE) {
-                    if (!ipv4_lpm.apply().hit) {
+                    meta.route_ready = 1;
+                } else if (meta.ingress_zone == ZONE_INSIDE &&
+                           meta.destination_zone == ZONE_OUTSIDE) {
+                    if (hdr.tcp.isValid() &&
+                        hdr.ipv4.total_len >=
+                            IPV4_HEADER_BYTES + TCP_MIN_HEADER_BYTES &&
+                        hdr.tcp.data_offset >= 5 &&
+                        ((bit<16>) hdr.tcp.data_offset << 2) <=
+                            hdr.ipv4.total_len - IPV4_HEADER_BYTES &&
+                        nat_outbound.apply().hit) {
+                        meta.route_ready = 1;
+                    } else {
+                        mark_to_drop(standard_metadata);
+                    }
+                } else if (meta.ingress_zone == ZONE_OUTSIDE &&
+                           meta.destination_zone == ZONE_PUBLIC) {
+                    if (hdr.tcp.isValid() &&
+                        hdr.ipv4.total_len >=
+                            IPV4_HEADER_BYTES + TCP_MIN_HEADER_BYTES &&
+                        hdr.tcp.data_offset >= 5 &&
+                        ((bit<16>) hdr.tcp.data_offset << 2) <=
+                            hdr.ipv4.total_len - IPV4_HEADER_BYTES &&
+                        nat_inbound.apply().hit) {
+                        meta.route_ready = 1;
+                    } else {
                         mark_to_drop(standard_metadata);
                     }
                 } else {
+                    mark_to_drop(standard_metadata);
+                }
+
+                if (meta.route_ready == 1 && !ipv4_lpm.apply().hit) {
                     mark_to_drop(standard_metadata);
                 }
             } else {
@@ -235,6 +325,28 @@ control ComputeChecksumImpl(inout headers_t hdr, inout metadata_t meta) {
                 hdr.ipv4.dst_addr
             },
             hdr.ipv4.hdr_checksum,
+            HashAlgorithm.csum16);
+
+        update_checksum_with_payload(
+            hdr.tcp.isValid(),
+            {
+                hdr.ipv4.src_addr,
+                hdr.ipv4.dst_addr,
+                8w0,
+                hdr.ipv4.protocol,
+                meta.transport_len,
+                hdr.tcp.src_port,
+                hdr.tcp.dst_port,
+                hdr.tcp.seq_no,
+                hdr.tcp.ack_no,
+                hdr.tcp.data_offset,
+                hdr.tcp.reserved,
+                hdr.tcp.ns,
+                hdr.tcp.flags,
+                hdr.tcp.window,
+                hdr.tcp.urgent_ptr
+            },
+            hdr.tcp.checksum,
             HashAlgorithm.csum16);
     }
 }
