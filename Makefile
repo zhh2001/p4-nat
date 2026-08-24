@@ -9,7 +9,8 @@ P4_JSON := $(BUILD_DIR)/nat.json
 P4INFO := $(BUILD_DIR)/nat.p4info.txtpb
 CONTROLLER := $(BUILD_DIR)/p4natctl
 CONTROLLER_SOURCES := $(filter-out %_test.go,$(wildcard controller/*.go))
-PYTHON_SOURCES := mininet/topology.py tests/test_forwarding.py
+PYTHON_SOURCES := mininet/topology.py tests/test_artifacts.py \
+	tests/test_forwarding.py tests/test_runtime.py
 P4RUNTIME_PORT ?= 9559
 THRIFT_PORT ?= 9090
 
@@ -40,8 +41,12 @@ test-unit: build
 	$(GO) vet ./...
 	PYTHONPYCACHEPREFIX=$(BUILD_DIR)/pycache \
 		$(PYTHON) -m py_compile $(PYTHON_SOURCES)
+	PYTHONPYCACHEPREFIX=$(BUILD_DIR)/pycache \
+		$(PYTHON) -m unittest discover -s tests -p 'test_artifacts.py'
 
 test-integration: build
+	$(SUDO) env PYTHONDONTWRITEBYTECODE=1 \
+		$(PYTHON) tests/test_runtime.py
 	$(SUDO) env PYTHONDONTWRITEBYTECODE=1 \
 		P4NAT_GRPC_PORT=$(P4RUNTIME_PORT) \
 		P4NAT_THRIFT_PORT=$(THRIFT_PORT) \

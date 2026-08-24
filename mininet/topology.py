@@ -267,16 +267,22 @@ class P4NatNetwork:
         _check_port_available(self.grpc_port)
         _check_port_available(self.thrift_port)
 
-        self._runtime_dir = tempfile.TemporaryDirectory(prefix="p4-nat-")
-        topology = NatTopology(
-            grpc_port=self.grpc_port,
-            thrift_port=self.thrift_port,
-            device_id=self.device_id,
-            runtime_dir=self._runtime_dir.name,
-            switch_executable=self.switch_executable,
-        )
-        self.net = Mininet(topo=topology, controller=None, waitConnected=False)
         try:
+            self._runtime_dir = tempfile.TemporaryDirectory(prefix="p4-nat-")
+            topology = NatTopology(
+                grpc_port=self.grpc_port,
+                thrift_port=self.thrift_port,
+                device_id=self.device_id,
+                runtime_dir=self._runtime_dir.name,
+                switch_executable=self.switch_executable,
+            )
+            self.net = Mininet(
+                topo=topology,
+                controller=None,
+                build=False,
+                waitConnected=False,
+            )
+            self.net.build()
             self.net.start()
             for name, config in HOSTS.items():
                 _configure_host(self.net.get(name), config)

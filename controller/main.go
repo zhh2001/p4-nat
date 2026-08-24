@@ -24,6 +24,7 @@ type options struct {
 	deviceID         uint64
 	p4InfoPath       string
 	deviceConfigPath string
+	verifyOnly       bool
 }
 
 func main() {
@@ -68,11 +69,13 @@ func run(parent context.Context, args []string) error {
 	}
 	defer c.Close()
 
-	if err := c.BecomePrimary(ctx); err != nil {
-		return fmt.Errorf("become primary: %w", err)
-	}
-	if _, err := c.SetPipeline(ctx, pl, client.SetPipelineOptions{}); err != nil {
-		return fmt.Errorf("install pipeline: %w", err)
+	if !opts.verifyOnly {
+		if err := c.BecomePrimary(ctx); err != nil {
+			return fmt.Errorf("become primary: %w", err)
+		}
+		if _, err := c.SetPipeline(ctx, pl, client.SetPipelineOptions{}); err != nil {
+			return fmt.Errorf("install pipeline: %w", err)
+		}
 	}
 	installed, err := c.GetPipeline(ctx)
 	if err != nil {
@@ -87,9 +90,11 @@ func run(parent context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	updates := makeUpdates(entries)
-	if err := c.Write(ctx, client.WriteOptions{}, updates...); err != nil {
-		return fmt.Errorf("program table entries: %w", err)
+	if !opts.verifyOnly {
+		updates := makeUpdates(entries)
+		if err := c.Write(ctx, client.WriteOptions{}, updates...); err != nil {
+			return fmt.Errorf("program table entries: %w", err)
+		}
 	}
 	readback, err := c.ReadTableEntries(ctx, 0)
 	if err != nil {
@@ -99,7 +104,11 @@ func run(parent context.Context, args []string) error {
 		return fmt.Errorf("verify table entries: %w", err)
 	}
 
-	fmt.Printf("configured and verified %d table entries\n", len(entries))
+	if opts.verifyOnly {
+		fmt.Printf("verified %d table entries\n", len(entries))
+	} else {
+		fmt.Printf("configured and verified %d table entries\n", len(entries))
+	}
 	return nil
 }
 
@@ -111,6 +120,7 @@ func parseOptions(args []string) (options, error) {
 	flags.Uint64Var(&opts.deviceID, "device-id", 1, "P4Runtime device ID")
 	flags.StringVar(&opts.p4InfoPath, "p4info", "build/nat.p4info.txtpb", "P4Info text file")
 	flags.StringVar(&opts.deviceConfigPath, "device-config", "build/nat.json", "BMv2 JSON file")
+	flags.BoolVar(&opts.verifyOnly, "verify-only", false, "verify the installed configuration without changing it")
 	if err := flags.Parse(args); err != nil {
 		return options{}, err
 	}

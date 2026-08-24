@@ -315,6 +315,54 @@ with socket.socket(
         raise RuntimeError(f"raw packet injection failed: {detail}")
 
 
+def wait_for_line(process, expected, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"process exited with status {process.returncode}: {detail}"
+            )
+        readable, _, _ = select.select([process.stdout], [], [], 0.1)
+        if readable:
+            line = process.stdout.readline().decode("utf-8", errors="replace").strip()
+            if line == expected:
+                return
+            raise RuntimeError(f"unexpected process output: {line!r}")
+    raise TimeoutError(f"timed out waiting for process output {expected!r}")
+
+
+def stop_child(process):
+    if process is None:
+        return
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1.0)
+    for stream in (process.stdout, process.stderr):
+        if stream is not None and not stream.closed:
+            stream.close()
+
+
+def communicate_child(process, label, timeout):
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        process.kill()
+        process.communicate()
+        raise RuntimeError(f"{label} timed out") from error
+    if process.returncode != 0:
+        detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            f"{label} exited with status {process.returncode}: {detail}"
+        )
+    return stdout
+
+
 class PacketIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -328,6 +376,13 @@ class PacketIntegrationTest(unittest.TestCase):
             thrift_port=int(os.environ.get("P4NAT_THRIFT_PORT", "9090")),
         )
         cls.runtime.start()
+        switch = cls.runtime.net.get("s1")
+        cls.runtime_path = Path(cls.runtime._runtime_dir.name)
+        cls.switch_pid = switch.process.pid
+        cls.switch_interfaces = tuple(
+            switch.intfs[port].name for port in (1, 2, 3)
+        )
+        cls.runtime_ports = (cls.runtime.grpc_port, cls.runtime.thrift_port)
         if cls.runtime.controller_output != "configured and verified 13 table entries":
             cls.runtime.close()
             raise AssertionError(
@@ -351,32 +406,29 @@ class PacketIntegrationTest(unittest.TestCase):
     ):
         source_host = self.runtime.net.get(source)
         destination_host = self.runtime.net.get(destination)
-        outside_host = self.runtime.net.get("h3")
         source_config = HOSTS[source]
         destination_config = HOSTS[destination]
         source_ip = source_config["address"].split("/", 1)[0]
         destination_ip = destination_config["address"].split("/", 1)[0]
+        unintended = next(name for name in HOSTS if name not in {source, destination})
         capture_filter = (
             f"udp and src host {source_ip} and dst host {destination_ip} "
             f"and src port {sport} and dst port {dport}"
         )
 
         with tempfile.TemporaryDirectory(prefix="p4-nat-packets-") as directory:
-            intended = PacketCapture(
-                destination_host,
-                destination_host.defaultIntf().name,
-                Path(directory) / "intended.pcap",
-                capture_filter,
-            )
-            unintended = PacketCapture(
-                outside_host,
-                outside_host.defaultIntf().name,
-                Path(directory) / "outside.pcap",
-                capture_filter,
-            )
+            captures = {
+                name: PacketCapture(
+                    self.runtime.net.get(name),
+                    self.runtime.net.get(name).defaultIntf().name,
+                    Path(directory) / f"{name}.pcap",
+                    capture_filter,
+                )
+                for name in HOSTS
+            }
             try:
-                intended.start()
-                unintended.start()
+                for capture in captures.values():
+                    capture.start()
                 send_udp(
                     source_host,
                     source_host.defaultIntf().name,
@@ -392,46 +444,61 @@ class PacketIntegrationTest(unittest.TestCase):
                 )
                 time.sleep(0.25)
             finally:
-                intended.stop()
-                unintended.stop()
+                for capture in captures.values():
+                    capture.stop()
 
-            intended_packets = intended.packets()
-            unintended_packets = unintended.packets()
+            observed = {
+                name: capture.packets()
+                for name, capture in captures.items()
+            }
 
         self.assertEqual(
-            len(intended_packets),
+            len(observed[source]),
             1,
-            f"{source}->{destination}: expected one destination packet, got {len(intended_packets)}",
+            f"{source}->{destination}: expected one source packet, got {len(observed[source])}",
         )
         self.assertEqual(
-            len(unintended_packets),
-            0,
-            f"{source}->{destination}: observed {len(unintended_packets)} unexpected outside packets",
+            len(observed[destination]),
+            1,
+            f"{source}->{destination}: expected one destination packet, "
+            f"got {len(observed[destination])}",
         )
-
-        packet = intended_packets[0]
-        self.assertEqual(packet[Ether].src, destination_config["switch_mac"])
-        self.assertEqual(packet[Ether].dst, destination_config["mac"])
-        self.assertEqual(packet[IP].src, source_ip)
-        self.assertEqual(packet[IP].dst, destination_ip)
-        self.assertEqual(packet[IP].ttl, 63)
-        self.assertEqual(packet[IP].id, ip_id)
-        self.assertEqual(int(packet[IP].flags), ip_flags)
-        self.assertEqual(packet[UDP].sport, sport)
-        self.assertEqual(packet[UDP].dport, dport)
-        self.assertEqual(bytes(packet[Raw].load), token)
-        self.assertTrue(
-            udp_checksum_valid(packet),
-            f"{source}->{destination}: invalid forwarded UDP checksum",
-        )
-
-        raw_ip = bytes(packet[IP])
-        header_length = (raw_ip[0] & 0x0F) * 4
         self.assertEqual(
-            internet_checksum(raw_ip[:header_length]),
+            len(observed[unintended]),
             0,
-            f"{source}->{destination}: invalid forwarded IPv4 checksum",
+            f"{source}->{destination}: observed {len(observed[unintended])} "
+            f"packets on {unintended}",
         )
+
+        input_packet = observed[source][0]
+        output_packet = observed[destination][0]
+        self.assertEqual(input_packet[Ether].src, source_config["mac"])
+        self.assertEqual(input_packet[Ether].dst, source_config["switch_mac"])
+        self.assertEqual(output_packet[Ether].src, destination_config["switch_mac"])
+        self.assertEqual(output_packet[Ether].dst, destination_config["mac"])
+        for packet in (input_packet, output_packet):
+            self.assertEqual(packet[IP].src, source_ip)
+            self.assertEqual(packet[IP].dst, destination_ip)
+            self.assertEqual(packet[IP].id, ip_id)
+            self.assertEqual(int(packet[IP].flags), ip_flags)
+            self.assertEqual(packet[UDP].sport, sport)
+            self.assertEqual(packet[UDP].dport, dport)
+            self.assertEqual(bytes(packet[Raw].load), token)
+        self.assertEqual(input_packet[IP].ttl, 64)
+        self.assertEqual(output_packet[IP].ttl, input_packet[IP].ttl - 1)
+
+        for label, packet in (("input", input_packet), ("output", output_packet)):
+            raw_ip = bytes(packet[IP])
+            header_length = (raw_ip[0] & 0x0F) * 4
+            self.assertEqual(
+                internet_checksum(raw_ip[:header_length]),
+                0,
+                f"{source}->{destination}: invalid {label} IPv4 checksum",
+            )
+            self.assertTrue(
+                udp_checksum_valid(packet),
+                f"{source}->{destination}: invalid {label} UDP checksum",
+            )
 
     def assert_tcp_translation(
         self,
@@ -757,6 +824,250 @@ class PacketIntegrationTest(unittest.TestCase):
                     f"{label}: observed {count} unexpected packets on {name}",
                 )
 
+    def test_controller_readback_and_runtime_readiness(self):
+        switch = self.runtime.net.get("s1")
+        self.assertIsNotNone(switch.process)
+        self.assertIsNone(switch.process.poll())
+        for port in (1, 2, 3):
+            self.assertEqual(switch.intfs[port].name, f"s1-eth{port}")
+        for port in (self.runtime.grpc_port, self.runtime.thrift_port):
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                pass
+        self.assertEqual(
+            self.runtime.controller_output,
+            "configured and verified 13 table entries",
+        )
+
+        result = subprocess.run(
+            [
+                str(ROOT / "build" / "p4natctl"),
+                "--address",
+                f"127.0.0.1:{self.runtime.grpc_port}",
+                "--device-id",
+                str(self.runtime.device_id),
+                "--p4info",
+                str(ROOT / "build" / "nat.p4info.txtpb"),
+                "--device-config",
+                str(ROOT / "build" / "nat.json"),
+                "--verify-only",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.strip())
+        self.assertEqual(result.stdout.strip(), "verified 13 table entries")
+
+    def test_real_tcp_socket_translation(self):
+        server_script = """
+import socket
+import sys
+
+address = sys.argv[1]
+port = int(sys.argv[2])
+expected = bytes.fromhex(sys.argv[3])
+response = bytes.fromhex(sys.argv[4])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.settimeout(5.0)
+    server.bind((address, port))
+    server.listen(1)
+    print("READY", flush=True)
+    connection, peer = server.accept()
+    with connection:
+        connection.settimeout(5.0)
+        received = bytearray()
+        while len(received) < len(expected):
+            chunk = connection.recv(len(expected) - len(received))
+            if not chunk:
+                break
+            received.extend(chunk)
+        if bytes(received) != expected:
+            raise RuntimeError(f"received {bytes(received)!r}, expected {expected!r}")
+        connection.sendall(response)
+        print(f"{peer[0]} {peer[1]} {bytes(received).hex()}", flush=True)
+"""
+        client_script = """
+import socket
+import sys
+
+source_address = sys.argv[1]
+source_port = int(sys.argv[2])
+destination_address = sys.argv[3]
+destination_port = int(sys.argv[4])
+request = bytes.fromhex(sys.argv[5])
+expected = bytes.fromhex(sys.argv[6])
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+    client.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    client.settimeout(5.0)
+    client.bind((source_address, source_port))
+    client.connect((destination_address, destination_port))
+    client.sendall(request)
+    received = bytearray()
+    while len(received) < len(expected):
+        chunk = client.recv(len(expected) - len(received))
+        if not chunk:
+            break
+        received.extend(chunk)
+    if bytes(received) != expected:
+        raise RuntimeError(f"received {bytes(received)!r}, expected {expected!r}")
+    print(bytes(received).hex(), flush=True)
+"""
+        source_port = 45001
+        destination_port = 18080
+        request = b"real-tcp-request-6d32a9f1"
+        response = b"real-tcp-response-b17e403c"
+        h1 = self.runtime.net.get("h1")
+        h3 = self.runtime.net.get("h3")
+        server = h3.popen(
+            [
+                sys.executable,
+                "-c",
+                server_script,
+                "10.0.3.1",
+                str(destination_port),
+                request.hex(),
+                response.hex(),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        client = None
+        server_output = b""
+        client_output = b""
+
+        with tempfile.TemporaryDirectory(prefix="p4-nat-socket-") as directory:
+            capture_filter = f"tcp and port {destination_port}"
+            captures = {
+                name: PacketCapture(
+                    self.runtime.net.get(name),
+                    self.runtime.net.get(name).defaultIntf().name,
+                    Path(directory) / f"{name}.pcap",
+                    capture_filter,
+                )
+                for name in HOSTS
+            }
+            try:
+                wait_for_line(server, "READY", timeout=3.0)
+                for capture in captures.values():
+                    capture.start()
+                client = h1.popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        client_script,
+                        "10.0.1.1",
+                        str(source_port),
+                        "10.0.3.1",
+                        str(destination_port),
+                        request.hex(),
+                        response.hex(),
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                client_output = communicate_child(client, "TCP client", timeout=6.0)
+                server_output = communicate_child(server, "TCP server", timeout=6.0)
+                time.sleep(0.25)
+            finally:
+                for capture in captures.values():
+                    capture.stop()
+                stop_child(client)
+                stop_child(server)
+
+            observed = {
+                name: capture.packets()
+                for name, capture in captures.items()
+            }
+
+        self.assertEqual(client_output.decode().strip(), response.hex())
+        peer_ip, peer_port, received = server_output.decode().strip().split()
+        self.assertEqual(peer_ip, "192.0.2.1")
+        self.assertEqual(int(peer_port), source_port)
+        self.assertEqual(received, request.hex())
+
+        def packets_with_payload(name, payload):
+            return [
+                packet
+                for packet in observed[name]
+                if packet.haslayer(TCP) and bytes(packet[TCP].payload) == payload
+            ]
+
+        request_inside = packets_with_payload("h1", request)
+        request_outside = packets_with_payload("h3", request)
+        response_outside = packets_with_payload("h3", response)
+        response_inside = packets_with_payload("h1", response)
+        self.assertEqual(len(request_inside), 1, "request multiplicity on h1")
+        self.assertEqual(len(request_outside), 1, "request multiplicity on h3")
+        self.assertEqual(len(response_outside), 1, "response multiplicity on h3")
+        self.assertEqual(len(response_inside), 1, "response multiplicity on h1")
+        self.assertEqual(len(observed["h2"]), 0, "real TCP traffic leaked to h2")
+
+        request_input = request_inside[0]
+        request_output = request_outside[0]
+        response_input = response_outside[0]
+        response_output = response_inside[0]
+        expected = (
+            (
+                request_input,
+                HOSTS["h1"]["mac"],
+                HOSTS["h1"]["switch_mac"],
+                "10.0.1.1",
+                "10.0.3.1",
+                source_port,
+                destination_port,
+                64,
+                request,
+            ),
+            (
+                request_output,
+                HOSTS["h3"]["switch_mac"],
+                HOSTS["h3"]["mac"],
+                "192.0.2.1",
+                "10.0.3.1",
+                source_port,
+                destination_port,
+                63,
+                request,
+            ),
+            (
+                response_input,
+                HOSTS["h3"]["mac"],
+                HOSTS["h3"]["switch_mac"],
+                "10.0.3.1",
+                "192.0.2.1",
+                destination_port,
+                source_port,
+                64,
+                response,
+            ),
+            (
+                response_output,
+                HOSTS["h1"]["switch_mac"],
+                HOSTS["h1"]["mac"],
+                "10.0.3.1",
+                "10.0.1.1",
+                destination_port,
+                source_port,
+                63,
+                response,
+            ),
+        )
+        for packet, src_mac, dst_mac, src_ip, dst_ip, sport, dport, ttl, payload in expected:
+            self.assertEqual(packet[Ether].src, src_mac)
+            self.assertEqual(packet[Ether].dst, dst_mac)
+            self.assertEqual(packet[IP].src, src_ip)
+            self.assertEqual(packet[IP].dst, dst_ip)
+            self.assertEqual(packet[IP].ttl, ttl)
+            self.assertEqual(packet[TCP].sport, sport)
+            self.assertEqual(packet[TCP].dport, dport)
+            self.assertEqual(bytes(packet[TCP].payload), payload)
+            raw_ip = bytes(packet[IP])
+            header_length = (raw_ip[0] & 0x0F) * 4
+            self.assertEqual(internet_checksum(raw_ip[:header_length]), 0)
+            self.assertTrue(tcp_checksum_valid(packet))
+
     def test_h1_to_h2_is_not_translated(self):
         self.assert_forwarded(
             "h1",
@@ -1035,6 +1346,57 @@ class PacketIntegrationTest(unittest.TestCase):
             "TCP data-offset fixture has an invalid checksum",
         )
 
+        bad_tcp_checksum = bytearray(
+            tcp_frame(
+                "h1",
+                "10.0.1.1",
+                "10.0.3.1",
+                0x1513,
+                43019,
+                9319,
+            )
+        )
+        bad_tcp_checksum[14 + 20 + 16] ^= 0x01
+        self.assertFalse(tcp_checksum_valid(Ether(bad_tcp_checksum)))
+
+        bad_udp_checksum = ipv4_test_frame(
+            "h1",
+            IP(
+                src="10.0.1.1",
+                dst="10.0.3.1",
+                id=0x1514,
+            )
+            / UDP(
+                sport=44020,
+                dport=9420,
+                chksum=0xFFFF,
+            )
+            / Raw(b"drop-bad-udp-checksum-1514"),
+        )
+        self.assertFalse(udp_checksum_valid(Ether(bad_udp_checksum)))
+
+        oversized_tcp_data_offset = ipv4_test_frame(
+            "h1",
+            IP(
+                src="10.0.1.1",
+                dst="10.0.3.1",
+                id=0x1516,
+            )
+            / TCP(
+                sport=43022,
+                dport=9322,
+                dataofs=15,
+                flags=0x18,
+                seq=0x1516,
+                ack=0x1517,
+            )
+            / Raw(b"drop-tcp-offset-1516"),
+        )
+        self.assertTrue(
+            tcp_checksum_valid(Ether(oversized_tcp_data_offset)),
+            "oversized TCP data-offset fixture has an invalid checksum",
+        )
+
         cases = [
             (
                 "outbound private NAT miss",
@@ -1292,6 +1654,35 @@ class PacketIntegrationTest(unittest.TestCase):
                     / Raw(b"drop-version-five-1512"),
                 ),
             ),
+            (
+                "invalid TCP checksum",
+                "h1",
+                bytes(bad_tcp_checksum),
+            ),
+            (
+                "invalid nonzero UDP checksum",
+                "h1",
+                bad_udp_checksum,
+            ),
+            (
+                "unsupported inbound protocol",
+                "h3",
+                ipv4_test_frame(
+                    "h3",
+                    IP(
+                        src="10.0.3.1",
+                        dst="192.0.2.1",
+                        id=0x1515,
+                        proto=99,
+                    )
+                    / Raw(b"drop-inbound-protocol-1515"),
+                ),
+            ),
+            (
+                "TCP data offset exceeds transport length",
+                "h1",
+                oversized_tcp_data_offset,
+            ),
         ]
 
         identifiers = [struct.unpack("!H", frame[18:20])[0] for _, _, frame in cases]
@@ -1307,6 +1698,21 @@ class PacketIntegrationTest(unittest.TestCase):
         for label, source, frame in cases:
             with self.subTest(case=label):
                 self.assert_dropped(label, source, frame)
+
+
+class SuccessfulRuntimeCleanupTest(unittest.TestCase):
+    def test_successful_runtime_cleanup(self):
+        self.assertIsNone(PacketIntegrationTest.runtime.net)
+        self.assertIsNone(PacketIntegrationTest.runtime._runtime_dir)
+        self.assertFalse(PacketIntegrationTest.runtime_path.exists())
+        self.assertFalse(
+            (Path("/proc") / str(PacketIntegrationTest.switch_pid)).exists()
+        )
+        for interface in PacketIntegrationTest.switch_interfaces:
+            self.assertFalse((Path("/sys/class/net") / interface).exists())
+        for port in PacketIntegrationTest.runtime_ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind(("127.0.0.1", port))
 
 
 if __name__ == "__main__":
