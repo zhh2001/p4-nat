@@ -1,0 +1,7 @@
+/build/
+__pycache__/
+*.py[cod]
+*.pcap
+*.log
+*.pid
+*.sock
