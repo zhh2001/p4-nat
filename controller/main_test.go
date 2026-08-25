@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
@@ -77,5 +78,11 @@ func TestParseOptionsRejectsInvalidArguments(t *testing.T) {
 				t.Fatalf("parseOptions error = %q, want it to contain %q", err, test.message)
 			}
 		})
+	}
+}
+
+func TestRunHelp(t *testing.T) {
+	if err := run(context.Background(), []string{"--help"}); err != nil {
+		t.Fatalf("run --help: %v", err)
 	}
 }

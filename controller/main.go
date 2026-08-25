@@ -40,6 +40,9 @@ func main() {
 func run(parent context.Context, args []string) error {
 	opts, err := parseOptions(args)
 	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 

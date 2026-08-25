@@ -300,61 +300,74 @@ class ArtifactTest(unittest.TestCase):
 
         tcp_updates = matching_checksums(("tcp", "checksum"), update=True, verify=False)
         self.assertEqual(len(tcp_updates), 1)
-        tcp_calculation = calculations[tcp_updates[0]["calculation"]]
-        self.assertEqual(tcp_calculation["algo"], "csum16")
-        tcp_fields, tcp_payload, tcp_zero = calculation_inputs(tcp_calculation)
-        self.assertTrue(tcp_payload)
-        self.assertTrue(tcp_zero)
-        self.assertTrue(
-            {
-                ("ipv4", "src_addr"),
-                ("ipv4", "dst_addr"),
-                ("ipv4", "protocol"),
-                ("scalars", "metadata_t.transport_len"),
-                ("tcp", "src_port"),
-                ("tcp", "dst_port"),
-                ("tcp", "seq_no"),
-                ("tcp", "ack_no"),
-                ("tcp", "data_offset"),
-                ("tcp", "reserved"),
-                ("tcp", "ns"),
-                ("tcp", "flags"),
-                ("tcp", "window"),
-                ("tcp", "urgent_ptr"),
-            }.issubset(tcp_fields)
-        )
+        tcp_verifies = matching_checksums(("tcp", "checksum"), update=False, verify=True)
+        self.assertEqual(len(tcp_verifies), 1)
+        for checksum in (tcp_updates[0], tcp_verifies[0]):
+            tcp_calculation = calculations[checksum["calculation"]]
+            self.assertEqual(tcp_calculation["algo"], "csum16")
+            tcp_fields, tcp_payload, tcp_zero = calculation_inputs(tcp_calculation)
+            self.assertFalse(tcp_payload)
+            self.assertTrue(tcp_zero)
+            self.assertTrue(
+                {
+                    ("ipv4", "src_addr"),
+                    ("ipv4", "dst_addr"),
+                    ("ipv4", "protocol"),
+                    ("scalars", "metadata_t.transport_len"),
+                    ("tcp", "src_port"),
+                    ("tcp", "dst_port"),
+                    ("tcp", "seq_no"),
+                    ("tcp", "ack_no"),
+                    ("tcp", "data_offset"),
+                    ("tcp", "reserved"),
+                    ("tcp", "ns"),
+                    ("tcp", "flags"),
+                    ("tcp", "window"),
+                    ("tcp", "urgent_ptr"),
+                    ("transport_data", "data"),
+                }.issubset(tcp_fields)
+            )
 
         udp_updates = matching_checksums(("udp", "checksum"), update=True, verify=False)
-        payload_updates = []
+        transport_updates = []
         repair_updates = []
         for checksum in udp_updates:
             calculation = calculations[checksum["calculation"]]
-            if any(item["type"] == "payload" for item in calculation["input"]):
-                payload_updates.append(checksum)
+            fields, _, _ = calculation_inputs(calculation)
+            if ("transport_data", "data") in fields:
+                transport_updates.append(checksum)
             else:
                 repair_updates.append(checksum)
-        self.assertEqual(len(payload_updates), 1)
+        self.assertEqual(len(transport_updates), 1)
         self.assertEqual(len(repair_updates), 1)
 
-        udp_calculation = calculations[payload_updates[0]["calculation"]]
-        self.assertEqual(udp_calculation["algo"], "csum16")
-        udp_fields, udp_payload, udp_zero = calculation_inputs(udp_calculation)
-        self.assertTrue(udp_payload)
-        self.assertTrue(udp_zero)
-        self.assertTrue(
-            {
-                ("ipv4", "src_addr"),
-                ("ipv4", "dst_addr"),
-                ("ipv4", "protocol"),
-                ("udp", "length"),
-                ("udp", "src_port"),
-                ("udp", "dst_port"),
-            }.issubset(udp_fields)
+        udp_verifies = matching_checksums(
+            ("scalars", "metadata_t.udp_checksum_zero"),
+            update=False,
+            verify=True,
         )
+        self.assertEqual(len(udp_verifies), 1)
+        for checksum in (transport_updates[0], udp_verifies[0]):
+            udp_calculation = calculations[checksum["calculation"]]
+            self.assertEqual(udp_calculation["algo"], "csum16")
+            udp_fields, udp_payload, udp_zero = calculation_inputs(udp_calculation)
+            self.assertFalse(udp_payload)
+            self.assertTrue(udp_zero)
+            self.assertTrue(
+                {
+                    ("ipv4", "src_addr"),
+                    ("ipv4", "dst_addr"),
+                    ("ipv4", "protocol"),
+                    ("udp", "length"),
+                    ("udp", "src_port"),
+                    ("udp", "dst_port"),
+                    ("transport_data", "data"),
+                }.issubset(udp_fields)
+            )
         self.assertTrue(
             any(
                 field[-1] == "metadata_t.udp_checksum_present"
-                for field in field_references(payload_updates[0].get("if_cond"))
+                for field in field_references(transport_updates[0].get("if_cond"))
             )
         )
 
@@ -378,7 +391,7 @@ class ArtifactTest(unittest.TestCase):
             )
         )
         self.assertLess(
-            self.bmv2["checksums"].index(payload_updates[0]),
+            self.bmv2["checksums"].index(transport_updates[0]),
             self.bmv2["checksums"].index(repair),
         )
 

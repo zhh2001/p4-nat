@@ -57,11 +57,17 @@ header udp_t {
     bit<16> checksum;
 }
 
+header transport_data_t {
+    // Maximum data following fixed IPv4 and UDP headers.
+    varbit<524056> data;
+}
+
 struct headers_t {
     ethernet_t ethernet;
     ipv4_t ipv4;
     tcp_t tcp;
     udp_t udp;
+    transport_data_t transport_data;
 }
 
 struct metadata_t {
@@ -110,19 +116,43 @@ parser ParserImpl(
 
     state parse_tcp {
         packet.extract(hdr.tcp);
+        transition select(hdr.ipv4.total_len) {
+            41 .. 0xffff: parse_tcp_data;
+            default: accept;
+        }
+    }
+
+    state parse_tcp_data {
+        packet.extract(
+            hdr.transport_data,
+            (bit<32>) (meta.transport_len - TCP_MIN_HEADER_BYTES) << 3);
         transition accept;
     }
 
     state parse_udp {
         packet.extract(hdr.udp);
         transition select(hdr.udp.checksum) {
-            0: accept;
+            0: select_udp_data;
             default: mark_udp_checksum_present;
         }
     }
 
     state mark_udp_checksum_present {
         meta.udp_checksum_present = 1;
+        transition select_udp_data;
+    }
+
+    state select_udp_data {
+        transition select(hdr.ipv4.total_len) {
+            29 .. 0xffff: parse_udp_data;
+            default: accept;
+        }
+    }
+
+    state parse_udp_data {
+        packet.extract(
+            hdr.transport_data,
+            (bit<32>) (meta.transport_len - UDP_HEADER_BYTES) << 3);
         transition accept;
     }
 }
@@ -147,7 +177,7 @@ control VerifyChecksumImpl(inout headers_t hdr, inout metadata_t meta) {
             hdr.ipv4.hdr_checksum,
             HashAlgorithm.csum16);
 
-        verify_checksum_with_payload(
+        verify_checksum(
             hdr.tcp.isValid(),
             {
                 hdr.ipv4.src_addr,
@@ -164,12 +194,13 @@ control VerifyChecksumImpl(inout headers_t hdr, inout metadata_t meta) {
                 hdr.tcp.ns,
                 hdr.tcp.flags,
                 hdr.tcp.window,
-                hdr.tcp.urgent_ptr
+                hdr.tcp.urgent_ptr,
+                hdr.transport_data.data
             },
             hdr.tcp.checksum,
             HashAlgorithm.csum16);
 
-        verify_checksum_with_payload(
+        verify_checksum(
             hdr.udp.isValid() && meta.udp_checksum_present == 1,
             {
                 hdr.ipv4.src_addr,
@@ -180,7 +211,8 @@ control VerifyChecksumImpl(inout headers_t hdr, inout metadata_t meta) {
                 hdr.udp.src_port,
                 hdr.udp.dst_port,
                 hdr.udp.length,
-                hdr.udp.checksum
+                hdr.udp.checksum,
+                hdr.transport_data.data
             },
             meta.udp_checksum_zero,
             HashAlgorithm.csum16);
@@ -373,7 +405,7 @@ control ComputeChecksumImpl(inout headers_t hdr, inout metadata_t meta) {
             hdr.ipv4.hdr_checksum,
             HashAlgorithm.csum16);
 
-        update_checksum_with_payload(
+        update_checksum(
             hdr.tcp.isValid(),
             {
                 hdr.ipv4.src_addr,
@@ -390,12 +422,13 @@ control ComputeChecksumImpl(inout headers_t hdr, inout metadata_t meta) {
                 hdr.tcp.ns,
                 hdr.tcp.flags,
                 hdr.tcp.window,
-                hdr.tcp.urgent_ptr
+                hdr.tcp.urgent_ptr,
+                hdr.transport_data.data
             },
             hdr.tcp.checksum,
             HashAlgorithm.csum16);
 
-        update_checksum_with_payload(
+        update_checksum(
             hdr.udp.isValid() && meta.udp_checksum_present == 1,
             {
                 hdr.ipv4.src_addr,
@@ -405,7 +438,8 @@ control ComputeChecksumImpl(inout headers_t hdr, inout metadata_t meta) {
                 hdr.udp.length,
                 hdr.udp.src_port,
                 hdr.udp.dst_port,
-                hdr.udp.length
+                hdr.udp.length,
+                hdr.transport_data.data
             },
             hdr.udp.checksum,
             HashAlgorithm.csum16);
@@ -427,6 +461,7 @@ control DeparserImpl(packet_out packet, in headers_t hdr) {
         packet.emit(hdr.ipv4);
         packet.emit(hdr.tcp);
         packet.emit(hdr.udp);
+        packet.emit(hdr.transport_data);
     }
 }
 

@@ -287,7 +287,7 @@ class P4NatNetwork:
             for name, config in HOSTS.items():
                 _configure_host(self.net.get(name), config)
             self._configure_pipeline()
-        except Exception:
+        except BaseException:
             self.close()
             raise
         return self

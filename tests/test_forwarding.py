@@ -10,7 +10,7 @@ import time
 import unittest
 from pathlib import Path
 
-from scapy.all import Ether, IP, Raw, TCP, UDP, rdpcap
+from scapy.all import Ether, IP, Padding, Raw, TCP, UDP, rdpcap
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -138,11 +138,24 @@ def udp_payload_for_checksum_result_zero(src_ip, dst_ip, sport, dport, prefix):
 
 
 def tcp_checksum_valid(packet):
-    tcp = bytes(packet[TCP])
-    pseudo_header = (
-        socket.inet_aton(packet[IP].src)
-        + socket.inet_aton(packet[IP].dst)
-        + struct.pack("!BBH", 0, packet[IP].proto, len(tcp))
+    if not packet.haslayer(IP) or not packet.haslayer(TCP):
+        return False
+    raw_ip = bytes(packet[IP])
+    if len(raw_ip) < 20 or raw_ip[0] >> 4 != 4:
+        return False
+    header_length = (raw_ip[0] & 0x0F) * 4
+    total_length = struct.unpack("!H", raw_ip[2:4])[0]
+    if (
+        header_length < 20
+        or total_length < header_length + 20
+        or total_length > len(raw_ip)
+        or raw_ip[9] != socket.IPPROTO_TCP
+    ):
+        return False
+    tcp_length = total_length - header_length
+    tcp = raw_ip[header_length:total_length]
+    pseudo_header = raw_ip[12:20] + struct.pack(
+        "!BBH", 0, socket.IPPROTO_TCP, tcp_length
     )
     return internet_checksum(pseudo_header + tcp) == 0
 
@@ -365,6 +378,31 @@ def communicate_child(process, label, timeout):
 
 class PacketIntegrationTest(unittest.TestCase):
     @classmethod
+    def _verify_runtime_cleanup(cls):
+        failures = []
+        if cls.runtime.net is not None:
+            failures.append("Mininet reference remains set")
+        if cls.runtime._runtime_dir is not None:
+            failures.append("runtime directory reference remains set")
+        if cls.runtime_path is not None and cls.runtime_path.exists():
+            failures.append(f"runtime directory remains: {cls.runtime_path}")
+        if cls.switch_pid is not None and (
+            Path("/proc") / str(cls.switch_pid)
+        ).exists():
+            failures.append(f"switch process remains: {cls.switch_pid}")
+        for interface in cls.switch_interfaces:
+            if (Path("/sys/class/net") / interface).exists():
+                failures.append(f"switch interface remains: {interface}")
+        for port in cls.runtime_ports:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                try:
+                    probe.bind(("127.0.0.1", port))
+                except OSError:
+                    failures.append(f"TCP port remains in use: {port}")
+        if failures:
+            raise AssertionError("runtime cleanup failed: " + "; ".join(failures))
+
+    @classmethod
     def setUpClass(cls):
         if os.geteuid() != 0:
             raise RuntimeError("packet integration tests require root privileges")
@@ -375,24 +413,31 @@ class PacketIntegrationTest(unittest.TestCase):
             grpc_port=int(os.environ.get("P4NAT_GRPC_PORT", "9559")),
             thrift_port=int(os.environ.get("P4NAT_THRIFT_PORT", "9090")),
         )
-        cls.runtime.start()
-        switch = cls.runtime.net.get("s1")
-        cls.runtime_path = Path(cls.runtime._runtime_dir.name)
-        cls.switch_pid = switch.process.pid
-        cls.switch_interfaces = tuple(
-            switch.intfs[port].name for port in (1, 2, 3)
-        )
+        cls.runtime_path = None
+        cls.switch_pid = None
+        cls.switch_interfaces = ()
         cls.runtime_ports = (cls.runtime.grpc_port, cls.runtime.thrift_port)
-        if cls.runtime.controller_output != "configured and verified 13 table entries":
-            cls.runtime.close()
-            raise AssertionError(
-                f"unexpected controller output: {cls.runtime.controller_output!r}"
+        cls.addClassCleanup(cls._verify_runtime_cleanup)
+        cls.addClassCleanup(cls.runtime.close)
+        try:
+            cls.runtime.start()
+            switch = cls.runtime.net.get("s1")
+            cls.runtime_path = Path(cls.runtime._runtime_dir.name)
+            cls.switch_pid = switch.process.pid
+            cls.switch_interfaces = tuple(
+                switch.intfs[port].name for port in (1, 2, 3)
             )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "runtime"):
+            cls.runtime_ports = (cls.runtime.grpc_port, cls.runtime.thrift_port)
+            if (
+                cls.runtime.controller_output
+                != "configured and verified 13 table entries"
+            ):
+                raise AssertionError(
+                    f"unexpected controller output: {cls.runtime.controller_output!r}"
+                )
+        except BaseException:
             cls.runtime.close()
+            raise
 
     def assert_forwarded(
         self,
@@ -405,7 +450,6 @@ class PacketIntegrationTest(unittest.TestCase):
         ip_flags=0,
     ):
         source_host = self.runtime.net.get(source)
-        destination_host = self.runtime.net.get(destination)
         source_config = HOSTS[source]
         destination_config = HOSTS[destination]
         source_ip = source_config["address"].split("/", 1)[0]
@@ -1068,6 +1112,160 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
             self.assertEqual(internet_checksum(raw_ip[:header_length]), 0)
             self.assertTrue(tcp_checksum_valid(packet))
 
+    def test_nonzero_ethernet_padding_is_not_checksummed(self):
+        cases = (
+            {
+                "name": "TCP payload",
+                "identifier": 0x1601,
+                "transport": TCP(
+                    sport=45161,
+                    dport=18161,
+                    flags=0x18,
+                    seq=0x16010203,
+                    ack=0x16020304,
+                ),
+                "layer": TCP,
+                "header_bytes": 20,
+                "validator": tcp_checksum_valid,
+                "token": b"tp16",
+                "padding_octet": 0xA5,
+            },
+            {
+                "name": "UDP payload",
+                "identifier": 0x1602,
+                "transport": UDP(sport=45162, dport=18162),
+                "layer": UDP,
+                "header_bytes": 8,
+                "validator": udp_checksum_valid,
+                "token": b"udp-pad-1602",
+                "padding_octet": 0x5A,
+            },
+            {
+                "name": "empty TCP",
+                "identifier": 0x1603,
+                "transport": TCP(
+                    sport=45163,
+                    dport=18163,
+                    flags=0x10,
+                    seq=0x16030405,
+                    ack=0x16040506,
+                ),
+                "layer": TCP,
+                "header_bytes": 20,
+                "validator": tcp_checksum_valid,
+                "token": b"",
+                "padding_octet": 0x3C,
+            },
+            {
+                "name": "empty UDP",
+                "identifier": 0x1604,
+                "transport": UDP(sport=45164, dport=18164),
+                "layer": UDP,
+                "header_bytes": 8,
+                "validator": udp_checksum_valid,
+                "token": b"",
+                "padding_octet": 0xC3,
+            },
+        )
+
+        for case in cases:
+            with self.subTest(protocol=case["name"]):
+                packet = (
+                    IP(
+                        src="10.0.1.1",
+                        dst="10.0.3.1",
+                        id=case["identifier"],
+                    )
+                    / case["transport"]
+                )
+                if case["token"]:
+                    packet = packet / Raw(case["token"])
+                base = ipv4_test_frame(
+                    "h1",
+                    packet,
+                )
+                self.assertLess(len(base), 60)
+                padding = bytes([case["padding_octet"]]) * (60 - len(base))
+                frame = base + padding
+                input_fixture = Ether(frame)
+                self.assertTrue(case["validator"](input_fixture))
+
+                capture_filter = f"ip and ip[4:2] = {case['identifier']}"
+                with tempfile.TemporaryDirectory(
+                    prefix="p4-nat-padding-"
+                ) as directory:
+                    captures = {
+                        name: PacketCapture(
+                            self.runtime.net.get(name),
+                            self.runtime.net.get(name).defaultIntf().name,
+                            Path(directory) / f"{name}.pcap",
+                            capture_filter,
+                        )
+                        for name in HOSTS
+                    }
+                    try:
+                        for capture in captures.values():
+                            capture.start()
+                        h1 = self.runtime.net.get("h1")
+                        send_raw_frame(h1, h1.defaultIntf().name, frame)
+                        time.sleep(0.25)
+                    finally:
+                        for capture in captures.values():
+                            capture.stop()
+
+                    observed = {
+                        name: capture.packets()
+                        for name, capture in captures.items()
+                    }
+
+                self.assertEqual(len(observed["h1"]), 1)
+                self.assertEqual(len(observed["h3"]), 1)
+                self.assertEqual(len(observed["h2"]), 0)
+                input_packet = observed["h1"][0]
+                output_packet = observed["h3"][0]
+                self.assertEqual(input_packet[Ether].src, HOSTS["h1"]["mac"])
+                self.assertEqual(
+                    input_packet[Ether].dst,
+                    HOSTS["h1"]["switch_mac"],
+                )
+                self.assertEqual(
+                    output_packet[Ether].src,
+                    HOSTS["h3"]["switch_mac"],
+                )
+                self.assertEqual(output_packet[Ether].dst, HOSTS["h3"]["mac"])
+
+                for packet, src_ip, ttl in (
+                    (input_packet, "10.0.1.1", 64),
+                    (output_packet, "192.0.2.1", 63),
+                ):
+                    self.assertEqual(len(bytes(packet)), 60)
+                    self.assertEqual(packet[IP].src, src_ip)
+                    self.assertEqual(packet[IP].dst, "10.0.3.1")
+                    self.assertEqual(packet[IP].ttl, ttl)
+                    self.assertEqual(packet[IP].id, case["identifier"])
+                    self.assertEqual(
+                        packet[case["layer"]].sport,
+                        case["transport"].sport,
+                    )
+                    self.assertEqual(
+                        packet[case["layer"]].dport,
+                        case["transport"].dport,
+                    )
+                    self.assertTrue(packet.haslayer(Padding))
+                    self.assertEqual(bytes(packet[Padding].load), padding)
+                    raw_ip = bytes(packet[IP])
+                    header_length = (raw_ip[0] & 0x0F) * 4
+                    total_length = struct.unpack("!H", raw_ip[2:4])[0]
+                    transport_payload = raw_ip[
+                        header_length + case["header_bytes"] : total_length
+                    ]
+                    self.assertEqual(transport_payload, case["token"])
+                    self.assertEqual(
+                        internet_checksum(raw_ip[:header_length]),
+                        0,
+                    )
+                    self.assertTrue(case["validator"](packet))
+
     def test_h1_to_h2_is_not_translated(self):
         self.assert_forwarded(
             "h1",
@@ -1698,21 +1896,6 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
         for label, source, frame in cases:
             with self.subTest(case=label):
                 self.assert_dropped(label, source, frame)
-
-
-class SuccessfulRuntimeCleanupTest(unittest.TestCase):
-    def test_successful_runtime_cleanup(self):
-        self.assertIsNone(PacketIntegrationTest.runtime.net)
-        self.assertIsNone(PacketIntegrationTest.runtime._runtime_dir)
-        self.assertFalse(PacketIntegrationTest.runtime_path.exists())
-        self.assertFalse(
-            (Path("/proc") / str(PacketIntegrationTest.switch_pid)).exists()
-        )
-        for interface in PacketIntegrationTest.switch_interfaces:
-            self.assertFalse((Path("/sys/class/net") / interface).exists())
-        for port in PacketIntegrationTest.runtime_ports:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                probe.bind(("127.0.0.1", port))
 
 
 if __name__ == "__main__":

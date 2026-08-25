@@ -29,7 +29,8 @@ $(CONTROLLER): $(CONTROLLER_SOURCES) go.mod go.sum
 	$(GO) build -o $@ ./controller
 
 run: build
-	$(SUDO) $(PYTHON) mininet/topology.py \
+	$(SUDO) env PYTHONDONTWRITEBYTECODE=1 \
+		$(PYTHON) mininet/topology.py \
 		--grpc-port $(P4RUNTIME_PORT) --thrift-port $(THRIFT_PORT)
 
 test: build
